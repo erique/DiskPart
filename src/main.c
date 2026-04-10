@@ -51,6 +51,9 @@ struct Library       *AslBase        = NULL;
 #define GID_SELECT  2
 #define GID_SHOWALL 3
 #define GID_QUIT    4
+#define GID_MANUAL  5
+
+#define RESULT_MANUAL (-3)
 
 /* ------------------------------------------------------------------ */
 /* Static data (too large for stack)                                   */
@@ -58,6 +61,7 @@ struct Library       *AslBase        = NULL;
 
 static struct DevNameList dev_names;
 static struct UnitList    unit_list;
+static char               manual_devname[64];
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                              */
@@ -91,7 +95,7 @@ static BOOL str_contains_ci(const char *hay, const char *needle)
 /* Returns TRUE if devname looks like a storage device worth showing by default. */
 static BOOL is_storage_device(const char *name)
 {
-    static const char * const keys[] = { "ide", "scsi", "flash", "usb", "uae", "gvp", "phase5", "ppc", NULL };
+    static const char * const keys[] = { "ide", "scsi", "flash", "usb", "uae", "gvp", "phase5", "ppc", "sdhc", "emmc", "nvme", NULL };
     UWORD i;
     for (i = 0; keys[i]; i++)
         if (str_contains_ci(name, keys[i])) return TRUE;
@@ -147,6 +151,7 @@ static WORD run_devname_window(void)
     struct Gadget  *gctx      = NULL;
     struct Gadget  *lv_gad    = NULL;
     struct Gadget  *showall_gad = NULL;
+    struct Gadget  *str_gad   = NULL;
     struct Window  *win       = NULL;
     WORD            sel       = -1;
     WORD            result    = -1;
@@ -176,10 +181,12 @@ static WORD run_devname_window(void)
         UWORD pad     = 4;
         UWORD btn_h   = font_h + 6;
         UWORD lv_h    = (UWORD)(font_h + 2) * 10;
-        UWORD win_h   = bor_t + pad + lv_h + pad + btn_h + pad + bor_b;
+        UWORD lbl_h   = (UWORD)(font_h + 2);  /* label floats above gadget top */
+        UWORD str_y   = bor_t + pad + lv_h + pad + lbl_h; /* room for label above */
+        UWORD btn_y   = str_y + btn_h + pad;
+        UWORD win_h   = btn_y + btn_h + pad + bor_b;
         /* Three buttons: [Select] [Show All] [Quit] */
         UWORD btn_w   = (inner_w - pad * 2 - pad * 2) / 3;
-        UWORD btn_y   = bor_t + pad + lv_h + pad;
 
         gctx = CreateContext(&glist);
         if (!gctx) goto cleanup;
@@ -205,6 +212,23 @@ static WORD run_devname_window(void)
             lv_gad = CreateGadgetA(LISTVIEW_KIND, gctx, &ng, lv_tags);
             if (!lv_gad) goto cleanup;
 
+            ng.ng_TopEdge    = str_y;
+            ng.ng_LeftEdge   = bor_l + pad;
+            ng.ng_Width      = inner_w - pad * 2;
+            ng.ng_Height     = btn_h;
+            ng.ng_GadgetText = "Manual device name:";
+            ng.ng_GadgetID   = GID_MANUAL;
+            ng.ng_Flags      = PLACETEXT_ABOVE;
+            {
+                struct TagItem str_tags[] = {
+                    { GTST_MaxChars, 63 },
+                    { TAG_DONE,      0  }
+                };
+                str_gad = CreateGadgetA(STRING_KIND, lv_gad, &ng, str_tags);
+                if (!str_gad) goto cleanup;
+            }
+            ng.ng_Flags = 0;
+
             ng.ng_TopEdge = btn_y;
             ng.ng_Height  = btn_h;
             ng.ng_Width   = btn_w;
@@ -212,7 +236,7 @@ static WORD run_devname_window(void)
             ng.ng_LeftEdge   = bor_l + pad;
             ng.ng_GadgetText = "Select";
             ng.ng_GadgetID   = GID_SELECT;
-            prev = CreateGadgetA(BUTTON_KIND, lv_gad, &ng, bt);
+            prev = CreateGadgetA(BUTTON_KIND, str_gad, &ng, bt);
             if (!prev) goto cleanup;
 
             ng.ng_LeftEdge   = bor_l + pad + btn_w + pad;
@@ -284,6 +308,9 @@ static WORD run_devname_window(void)
                     case GID_SELECT:
                         do_select = TRUE;
                         break;
+                    case GID_MANUAL:   /* Enter pressed in string gadget */
+                        do_select = TRUE;
+                        break;
                     case GID_SHOWALL:
                     {
                         struct TagItem detach[] = { { GTLV_Labels, ~0UL      }, { TAG_DONE, 0 } };
@@ -314,9 +341,18 @@ static WORD run_devname_window(void)
 
                 if (do_select) {
                     do_select = FALSE;
-                    if (sel >= 0 && sel < (WORD)display_count) {
-                        result  = sel_map[sel];
-                        running = FALSE;
+                    {
+                        const char *typed =
+                            ((struct StringInfo *)str_gad->SpecialInfo)->Buffer;
+                        if (typed[0] != '\0') {
+                            strncpy(manual_devname, typed, 63);
+                            manual_devname[63] = '\0';
+                            result  = RESULT_MANUAL;
+                            running = FALSE;
+                        } else if (sel >= 0 && sel < (WORD)display_count) {
+                            result  = sel_map[sel];
+                            running = FALSE;
+                        }
                     }
                 }
             }
@@ -697,8 +733,11 @@ int main(void)
     /* Navigation: driver name → unit → partition editor */
     {
         WORD name_idx;
-        while ((name_idx = run_devname_window()) >= 0) {
-            const char *devname = dev_names.names[name_idx];
+        while ((name_idx = run_devname_window()) != -1 &&
+               name_idx != RESULT_EXIT) {
+            const char *devname = (name_idx == RESULT_MANUAL)
+                                  ? manual_devname
+                                  : dev_names.names[name_idx];
             WORD unit_idx;
             BOOL quit = FALSE;
 

@@ -319,7 +319,7 @@ void Devices_GetUnitsForName(const char *devname, struct UnitList *ul,
     for (unit = 0; unit <= max_unit; unit++) {
         struct BlockDev  *bd;
         struct UnitEntry *ue;
-        char vendor[9], product[17], sz[16];
+        char vendor[9], product[17], sz[32];
         BOOL have_brand, have_size;
 
         if (ul->count >= MAX_KNOWN_DEVICES) break;
@@ -348,6 +348,11 @@ void Devices_GetUnitsForName(const char *devname, struct UnitList *ul,
             UQUAD total = (UQUAD)rdb->cylinders * rdb->heads *
                           rdb->sectors * 512UL;
             FormatSize(total, sz);
+            if (total >= (UQUAD)1024*1024*1024) {
+                char mb[16];
+                sprintf(mb, " (%lu MB)", (unsigned long)(total / (1024UL*1024UL)));
+                sprintf(sz + strlen(sz), " (%lu MB)", (unsigned long)(total / (1024UL*1024UL)));
+            }
             have_size = TRUE;
 
             if (!have_brand) {
@@ -371,6 +376,8 @@ void Devices_GetUnitsForName(const char *devname, struct UnitList *ul,
                 UQUAD total = (UQUAD)geom.dg_TotalSectors *
                               (UQUAD)geom.dg_SectorSize;
                 FormatSize(total, sz);
+                if (total >= (UQUAD)1024*1024*1024)
+                    sprintf(sz + strlen(sz), " (%lu MB)", (unsigned long)(total / (1024UL*1024UL)));
                 have_size = TRUE;
             }
         }
