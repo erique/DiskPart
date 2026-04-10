@@ -110,11 +110,13 @@ static void build_part_list(struct RDBInfo *rdb, WORD sel)
     for (i = 0; i < rdb->num_parts; i++) {
         struct PartInfo *pi = &rdb->parts[i];
         char dt[16], sz[16];
-        ULONG cyls  = pi->high_cyl - pi->low_cyl + 1;
+        ULONG cyls  = (pi->high_cyl >= pi->low_cyl)
+                      ? pi->high_cyl - pi->low_cyl + 1 : 0;
         ULONG heads = pi->heads   > 0 ? pi->heads   : rdb->heads;
         ULONG secs  = pi->sectors > 0 ? pi->sectors : rdb->sectors;
         ULONG bsz   = pi->block_size > 0 ? pi->block_size : 512;
         UQUAD bytes = (UQUAD)cyls * heads * secs * bsz;
+        const char *nm = pi->drive_name[0] ? pi->drive_name : "(none)";
 
         FormatDosType(pi->dos_type, dt);
         FormatSize(bytes, sz);
@@ -122,7 +124,7 @@ static void build_part_list(struct RDBInfo *rdb, WORD sel)
         /* ">" marker for selected row, space otherwise */
         sprintf(part_strs[i], "%c %-7s %6lu  %6lu  %-12s  %7s  %4ld",
                 ((WORD)i == sel) ? '>' : ' ',
-                pi->drive_name,
+                nm,
                 (unsigned long)pi->low_cyl,
                 (unsigned long)pi->high_cyl,
                 dt, sz,
@@ -261,13 +263,14 @@ static void draw_map(struct Window *win, struct RDBInfo *rdb, WORD sel,
             if (pw > 12) {
                 char  sz[16];
                 UWORD slen;
-                ULONG cyls2  = pi->high_cyl - pi->low_cyl + 1;
+                ULONG cyls2  = (pi->high_cyl >= pi->low_cyl)
+                               ? pi->high_cyl - pi->low_cyl + 1 : 0;
                 ULONG heads2 = pi->heads   > 0 ? pi->heads   : rdb->heads;
                 ULONG secs2  = pi->sectors > 0 ? pi->sectors : rdb->sectors;
                 UQUAD bytes2 = (UQUAD)cyls2 * heads2 * secs2 * 512UL;
                 WORD  txw    = rp->TxWidth ? (WORD)rp->TxWidth : 8;
                 WORD  max_c  = (pw - 4) / txw;
-                char  *nm    = pi->drive_name;
+                char  *nm    = pi->drive_name[0] ? pi->drive_name : "(none)";
                 UWORD nlen   = strlen(nm);
                 WORD  block_top; /* top of two-line text block */
 
@@ -377,7 +380,7 @@ static void draw_drag_info(struct Window *win, const struct RDBInfo *rdb,
 
     FormatSize(bytes, sz);
     sprintf(info, "%s: Cyl %lu - %lu  (%s)",
-            pi->drive_name,
+            pi->drive_name[0] ? pi->drive_name : "(none)",
             (unsigned long)pi->low_cyl,
             (unsigned long)pi->high_cyl,
             sz);
@@ -545,9 +548,12 @@ static void draw_info(struct Window *win, const char *devname, ULONG unit,
                     model, (unsigned)rdb->num_parts,
                     rdb->num_parts == 1 ? "" : "s", fsz);
         else
-            sprintf(line2, "RDB: %u partition%s  Free: %s",
+            sprintf(line2, "RDB: %u part  PL=%lu rd=%d id=%08lX  Free: %s",
                     (unsigned)rdb->num_parts,
-                    rdb->num_parts == 1 ? "" : "s", fsz);
+                    (unsigned long)rdb->part_list,
+                    (int)rdb->dbg_part_read,
+                    (unsigned long)rdb->dbg_part_id,
+                    fsz);
     } else {
         sprintf(line2, "RDB: Not found  (disk is unpartitioned)");
     }
@@ -2608,14 +2614,6 @@ static void rdb_view_block(struct Window *win, struct BlockDev *bd,
     UBYTE  *buf = NULL;
     struct RigidDiskBlock *r;
 
-    if (!rdb->valid) {
-        es.es_StructSize=sizeof(es); es.es_Flags=0;
-        es.es_Title=(UBYTE*)"View RDB Block";
-        es.es_TextFormat=(UBYTE*)"No RDB found on this disk.\nNothing to view.";
-        es.es_GadgetFormat=(UBYTE*)"OK";
-        EasyRequest(win, &es, NULL);
-        return;
-    }
     if (!bd) {
         es.es_StructSize=sizeof(es); es.es_Flags=0;
         es.es_Title=(UBYTE*)"View RDB Block";
@@ -2628,14 +2626,19 @@ static void rdb_view_block(struct Window *win, struct BlockDev *bd,
     buf = (UBYTE *)AllocVec(bd->block_size, MEMF_CHIP | MEMF_CLEAR);
     if (!buf) return;
 
-    if (!BlockDev_ReadBlock(bd, rdb->block_num, buf)) {
-        FreeVec(buf);
-        es.es_StructSize=sizeof(es); es.es_Flags=0;
-        es.es_Title=(UBYTE*)"View RDB Block";
-        es.es_TextFormat=(UBYTE*)"Failed to read RDB block from disk.";
-        es.es_GadgetFormat=(UBYTE*)"OK";
-        EasyRequest(win, &es, NULL);
-        return;
+    /* If no valid RDB was found, read block 0 and show it anyway.
+       The field display will be garbage, but the checksum and identity
+       lines will indicate what is actually on disk. */
+    { ULONG read_blk = rdb->valid ? rdb->block_num : 0;
+      if (!BlockDev_ReadBlock(bd, read_blk, buf)) {
+          FreeVec(buf);
+          es.es_StructSize=sizeof(es); es.es_Flags=0;
+          es.es_Title=(UBYTE*)"View RDB Block";
+          es.es_TextFormat=(UBYTE*)"Failed to read block from disk.";
+          es.es_GadgetFormat=(UBYTE*)"OK";
+          EasyRequest(win, &es, NULL);
+          return;
+      }
     }
 
     r = (struct RigidDiskBlock *)buf;
@@ -2652,6 +2655,9 @@ static void rdb_view_block(struct Window *win, struct BlockDev *bd,
         vrdb_list.lh_Head     = (struct Node *)&vrdb_list.lh_Tail;
         vrdb_list.lh_Tail     = NULL;
         vrdb_list.lh_TailPred = (struct Node *)&vrdb_list.lh_Head;
+
+        if (!rdb->valid)
+            vrdb_add("*** No valid RDB found — showing raw block 0 ***");
 
         /* --- Installed Filesystems (from parsed RDB) --- */
         { char b[80]; UWORD fi;
@@ -2940,6 +2946,321 @@ vrdb_cleanup:
 }
 
 /* ------------------------------------------------------------------ */
+/* Raw Block Scan — diagnostic: CMD_READ blocks 0-15 + block 0 dump   */
+/* Works regardless of rdb->valid; bypasses BlockDev_ReadBlock.        */
+/* ------------------------------------------------------------------ */
+
+static void rdb_raw_scan(struct Window *win, struct BlockDev *bd)
+{
+    UBYTE *buf;
+    ULONG  blk, i, j;
+    BYTE   err;
+    char   line[80];
+    struct EasyStruct es;
+
+    if (!bd) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Raw Block Scan";
+        es.es_TextFormat=(UBYTE*)"No device open.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL);
+        return;
+    }
+
+    buf = (UBYTE *)AllocVec(512, MEMF_CHIP | MEMF_CLEAR);
+    if (!buf) return;
+
+    vrdb_count = 0;
+    vrdb_list.lh_Head     = (struct Node *)&vrdb_list.lh_Tail;
+    vrdb_list.lh_Tail     = NULL;
+    vrdb_list.lh_TailPred = (struct Node *)&vrdb_list.lh_Head;
+
+    vrdb_add("--- CMD_READ scan, blocks 0-15 ---");
+
+    for (blk = 0; blk < 16; blk++) {
+        ULONG id;
+        char  idtxt[5];
+        const char *tag;
+
+        bd->iotd.iotd_Req.io_Command = CMD_READ;
+        bd->iotd.iotd_Req.io_Length  = 512;
+        bd->iotd.iotd_Req.io_Data    = (APTR)buf;
+        bd->iotd.iotd_Req.io_Offset  = blk * 512UL;
+        bd->iotd.iotd_Req.io_Flags   = 0;
+        bd->iotd.iotd_Count          = 0;
+        err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+
+        if (err != 0) {
+            sprintf(line, "Blk %2lu: CMD_READ err=%ld", (unsigned long)blk, (long)err);
+            vrdb_add(line);
+            continue;
+        }
+
+        id = ((ULONG)buf[0] << 24) | ((ULONG)buf[1] << 16) |
+             ((ULONG)buf[2] <<  8) |  (ULONG)buf[3];
+        for (i = 0; i < 4; i++) {
+            char c = (char)buf[i];
+            idtxt[i] = (c >= 0x20 && c <= 0x7E) ? c : '.';
+        }
+        idtxt[4] = '\0';
+
+        if      (id == IDNAME_RIGIDDISK) tag = "RDSK";
+        else if (id == IDNAME_PARTITION) tag = "PART";
+        else if (id == IDNAME_FSHEADER)  tag = "FSHD";
+        else if (id == IDNAME_LOADSEG)   tag = "LSEG";
+        else                             tag = "";
+
+        sprintf(line, "Blk %2lu: OK  id=%s 0x%08lX  %s",
+                (unsigned long)blk, idtxt, id, tag);
+        vrdb_add(line);
+    }
+
+    /* Re-read block 0 and show hex dump (first 128 bytes) */
+    vrdb_add("");
+    vrdb_add("--- Block 0 hex dump (bytes 0-127) ---");
+
+    bd->iotd.iotd_Req.io_Command = CMD_READ;
+    bd->iotd.iotd_Req.io_Length  = 512;
+    bd->iotd.iotd_Req.io_Data    = (APTR)buf;
+    bd->iotd.iotd_Req.io_Offset  = 0;
+    bd->iotd.iotd_Req.io_Flags   = 0;
+    bd->iotd.iotd_Count          = 0;
+    err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+
+    if (err != 0) {
+        vrdb_add("(re-read block 0 failed)");
+    } else {
+        for (i = 0; i < 128; i += 16) {
+            char *p = line;
+            sprintf(p, "%04lX: ", (unsigned long)i);
+            p += 6;
+            for (j = 0; j < 16; j++) {
+                sprintf(p, "%02lX ", (unsigned long)buf[i + j]);
+                p += 3;
+                if (j == 7) *p++ = ' ';
+            }
+            *p++ = ' ';
+            for (j = 0; j < 16; j++) {
+                char c = (char)buf[i + j];
+                *p++ = (c >= 0x20 && c <= 0x7E) ? c : '.';
+            }
+            *p = '\0';
+            vrdb_add(line);
+        }
+    }
+
+    /* Key RDSK fields + first PART block decode.
+       Scan blocks 0-15 to find the actual RDSK (same logic as RDB_Read). */
+    {
+    ULONG rdsk_blk = 0xFFFFFFFFUL;
+    ULONG scan_b;
+    for (scan_b = 0; scan_b < 16; scan_b++) {
+        ULONG id;
+        bd->iotd.iotd_Req.io_Command = CMD_READ;
+        bd->iotd.iotd_Req.io_Length  = 512;
+        bd->iotd.iotd_Req.io_Data    = (APTR)buf;
+        bd->iotd.iotd_Req.io_Offset  = scan_b * 512UL;
+        bd->iotd.iotd_Req.io_Flags   = 0;
+        bd->iotd.iotd_Count          = 0;
+        if (DoIO((struct IORequest *)&bd->iotd) != 0) continue;
+        id = ((ULONG)buf[0]<<24)|((ULONG)buf[1]<<16)|
+             ((ULONG)buf[2]<<8)|(ULONG)buf[3];
+        if (id == IDNAME_RIGIDDISK) { rdsk_blk = scan_b; break; }
+    }
+
+    if (rdsk_blk == 0xFFFFFFFFUL) {
+        vrdb_add("");
+        vrdb_add("--- RDSK: not found in blocks 0-15 ---");
+    } else {
+        /* buf still holds the RDSK block from the scan loop */
+        ULONG *lw = (ULONG *)buf;
+        ULONG part_blk;
+        char  hdr[48];
+        sprintf(hdr, "--- RDSK key fields (block %lu) ---", rdsk_blk);
+        vrdb_add("");
+        vrdb_add(hdr);
+        /* lw[7]=PartitionList  lw[16]=Cylinders  lw[17]=Sectors  lw[18]=Heads */
+        sprintf(line, "PartList=blk %lu  Cyls=%lu  Secs=%lu  Heads=%lu",
+                lw[7], lw[16], lw[17], lw[18]);
+        vrdb_add(line);
+
+        part_blk = lw[7];
+        vrdb_add("");
+        if (part_blk == RDB_END_MARK) {
+            vrdb_add("--- PART: PartitionList = end-of-list ---");
+        } else {
+            sprintf(line, "--- PART block at blk %lu ---", part_blk);
+            vrdb_add(line);
+
+            bd->iotd.iotd_Req.io_Command = CMD_READ;
+            bd->iotd.iotd_Req.io_Length  = 512;
+            bd->iotd.iotd_Req.io_Data    = (APTR)buf;
+            bd->iotd.iotd_Req.io_Offset  = part_blk * 512UL;
+            bd->iotd.iotd_Req.io_Flags   = 0;
+            bd->iotd.iotd_Count          = 0;
+            err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+
+            if (err != 0) {
+                sprintf(line, "  CMD_READ err=%ld", (long)err);
+                vrdb_add(line);
+            } else {
+                /* pb_DriveName BSTR @ offset 36; pb_Environment @ offset 128 */
+                UBYTE *bstr = buf + 36;
+                ULONG *env  = (ULONG *)(buf + 128);
+                UBYTE  nlen = bstr[0];
+                char   nm[33];
+                ULONG  k;
+                ULONG  pid = ((ULONG)buf[0]<<24)|((ULONG)buf[1]<<16)|
+                             ((ULONG)buf[2]<< 8)| (ULONG)buf[3];
+
+                sprintf(line, "  ID=0x%08lX  namelen=%lu", pid, (unsigned long)nlen);
+                vrdb_add(line);
+
+                if (nlen > 31) nlen = 31;
+                for (k = 0; k < (ULONG)nlen; k++) {
+                    char c = (char)bstr[1 + k];
+                    nm[k] = (c >= 0x20 && c <= 0x7E) ? c : '.';
+                }
+                nm[nlen] = '\0';
+                sprintf(line, "  Name='%s'", nm);
+                vrdb_add(line);
+
+                sprintf(line, "  env[0]=TableSz=%lu  env[1]=SizeBlk=%lu",
+                        env[0], env[1]);
+                vrdb_add(line);
+                sprintf(line, "  env[3]=Heads=%lu  env[5]=Secs=%lu",
+                        env[3], env[5]);
+                vrdb_add(line);
+                sprintf(line, "  env[9]=LoCyl=%lu  env[10]=HiCyl=%lu",
+                        env[9], env[10]);
+                vrdb_add(line);
+                sprintf(line, "  env[11]=NumBuf=%lu  env[15]=BootPri=%lu",
+                        env[11], env[15]);
+                vrdb_add(line);
+                sprintf(line, "  env[16]=DosType=0x%08lX", env[16]);
+                vrdb_add(line);
+
+                /* Hex dump of env region: bytes 128-175 (env[0]-env[11]) */
+                vrdb_add("  env hex (bytes 0x80-0xAF):");
+                { ULONG off;
+                  for (off = 128; off < 176; off += 16) {
+                      char *p = line;
+                      *p++ = ' '; *p++ = ' ';
+                      sprintf(p, "%04lX: ", (unsigned long)off); p += 6;
+                      for (k = 0; k < 16; k++) {
+                          sprintf(p, "%02lX ", (unsigned long)buf[off + k]);
+                          p += 3;
+                          if (k == 7) *p++ = ' ';
+                      }
+                      *p++ = ' ';
+                      for (k = 0; k < 16; k++) {
+                          char c = (char)buf[off + k];
+                          *p++ = (c >= 0x20 && c <= 0x7E) ? c : '.';
+                      }
+                      *p = '\0';
+                      vrdb_add(line);
+                  }
+                }
+            }
+        }
+    } /* end else (rdsk_blk found) */
+    } /* end rdsk scan block */
+
+    FreeVec(buf);
+
+    /* Open display window */
+    {
+        struct Screen  *scr    = NULL;
+        APTR            vi     = NULL;
+        struct Gadget  *glist  = NULL;
+        struct Window  *vwin   = NULL;
+        UWORD font_h, bor_t, bor_b, row_h, btn_h, pad, win_w, win_h, min_h;
+        UWORD scr_w, scr_h;
+
+        scr = LockPubScreen(NULL);
+        if (!scr) return;
+        vi = GetVisualInfoA(scr, NULL);
+        if (!vi) { UnlockPubScreen(NULL, scr); return; }
+
+        font_h = (UWORD)scr->Font->ta_YSize;
+        bor_t  = (UWORD)scr->WBorTop + font_h + 1;
+        bor_b  = (UWORD)scr->WBorBottom;
+        pad    = 4;
+        row_h  = font_h + 2;
+        btn_h  = font_h + 6;
+        win_w  = 560;
+        win_h  = bor_t + pad + row_h * 24 + pad + btn_h + pad + bor_b;
+        min_h  = bor_t + pad + row_h *  4 + pad + btn_h + pad + bor_b;
+        scr_w  = scr->Width;
+        scr_h  = scr->Height;
+
+        if (!vrdb_make_gadgets(vi, scr, win_w, win_h, &glist))
+            goto rscan_cleanup;
+
+        { struct TagItem wt[] = {
+              { WA_Left,      (ULONG)((scr_w - win_w) / 2) },
+              { WA_Top,       (ULONG)((scr_h - win_h) / 2) },
+              { WA_Width,     win_w }, { WA_Height, win_h },
+              { WA_Title,     (ULONG)"Raw Block Scan" },
+              { WA_Gadgets,   (ULONG)glist },
+              { WA_PubScreen, (ULONG)scr },
+              { WA_IDCMP,     IDCMP_CLOSEWINDOW|IDCMP_GADGETUP|
+                              IDCMP_GADGETDOWN|IDCMP_REFRESHWINDOW|IDCMP_NEWSIZE },
+              { WA_Flags,     WFLG_DRAGBAR|WFLG_DEPTHGADGET|
+                              WFLG_CLOSEGADGET|WFLG_ACTIVATE|WFLG_SIMPLE_REFRESH|
+                              WFLG_SIZEGADGET|WFLG_SIZEBBOTTOM },
+              { WA_MinWidth,  300 },
+              { WA_MinHeight, min_h },
+              { WA_MaxWidth,  scr_w },
+              { WA_MaxHeight, scr_h },
+              { TAG_DONE, 0 } };
+          vwin = OpenWindowTagList(NULL, wt); }
+
+        UnlockPubScreen(NULL, scr); scr = NULL;
+        if (!vwin) goto rscan_cleanup;
+        GT_RefreshWindow(vwin, NULL);
+
+        { BOOL running = TRUE;
+          while (running) {
+              struct IntuiMessage *imsg;
+              WaitPort(vwin->UserPort);
+              while ((imsg = GT_GetIMsg(vwin->UserPort)) != NULL) {
+                  ULONG iclass = imsg->Class;
+                  struct Gadget *gad = (struct Gadget *)imsg->IAddress;
+                  GT_ReplyIMsg(imsg);
+                  switch (iclass) {
+                  case IDCMP_CLOSEWINDOW:
+                      running = FALSE; break;
+                  case IDCMP_NEWSIZE: {
+                      struct Gadget *ng2 = NULL;
+                      RemoveGList(vwin, glist, -1);
+                      FreeGadgets(glist); glist = NULL;
+                      if (vrdb_make_gadgets(vi, vwin->WScreen,
+                                            (UWORD)vwin->Width, (UWORD)vwin->Height, &ng2)) {
+                          glist = ng2;
+                          AddGList(vwin, glist, ~0, -1, NULL);
+                          RefreshGList(glist, vwin, NULL, -1);
+                      }
+                      GT_RefreshWindow(vwin, NULL);
+                      break; }
+                  case IDCMP_REFRESHWINDOW:
+                      GT_BeginRefresh(vwin); GT_EndRefresh(vwin, TRUE); break;
+                  case IDCMP_GADGETUP:
+                      if (gad->GadgetID == VRDB_DONE) running = FALSE; break;
+                  }
+              }
+          }
+        }
+
+rscan_cleanup:
+        if (vwin)  { RemoveGList(vwin, glist, -1); CloseWindow(vwin); }
+        if (glist)   FreeGadgets(glist);
+        if (vi)      FreeVisualInfo(vi);
+        if (scr)     UnlockPubScreen(NULL, scr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 
 static void show_about(struct Window *win)
 {
@@ -2968,13 +3289,14 @@ static struct NewMenu partview_menu_def[] = {
     { NM_TITLE, "DiskPart",              NULL,         0, 0, NULL },
     { NM_ITEM,  "About...",              NULL,         0, 0, NULL },
     { NM_TITLE, "Advanced",              NULL,         0, 0, NULL },
-    { NM_ITEM,  "View RDB Block",        NULL,         0, 0, NULL },
-    { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },
-    { NM_ITEM,  "Backup RDB Block",      NULL,         0, 0, NULL },
-    { NM_ITEM,  "Restore RDB Block",     NULL,         0, 0, NULL },
-    { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },
-    { NM_ITEM,  "Extended Backup...",    NULL,         0, 0, NULL },
-    { NM_ITEM,  "Extended Restore...",   NULL,         0, 0, NULL },
+    { NM_ITEM,  "View RDB Block",        NULL,         0, 0, NULL },  /* ITEM 0 */
+    { NM_ITEM,  "Raw Block Scan...",     NULL,         0, 0, NULL },  /* ITEM 1 */
+    { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },  /* ITEM 2 */
+    { NM_ITEM,  "Backup RDB Block",      NULL,         0, 0, NULL },  /* ITEM 3 */
+    { NM_ITEM,  "Restore RDB Block",     NULL,         0, 0, NULL },  /* ITEM 4 */
+    { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },  /* ITEM 5 */
+    { NM_ITEM,  "Extended Backup...",    NULL,         0, 0, NULL },  /* ITEM 6 */
+    { NM_ITEM,  "Extended Restore...",   NULL,         0, 0, NULL },  /* ITEM 7 */
     { NM_END,   NULL,                    NULL,         0, 0, NULL },
 };
 
@@ -3207,13 +3529,15 @@ BOOL partview_run(const char *devname, ULONG unit)
                             show_about(win);
                         else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 0)
                             rdb_view_block(win, bd, rdb);
-                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 2)
-                            rdb_backup_block(win, bd, rdb);
+                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 1)
+                            rdb_raw_scan(win, bd);
                         else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 3)
+                            rdb_backup_block(win, bd, rdb);
+                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 4)
                             rdb_restore_block(win, bd);
-                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 5)
-                            rdb_backup_extended(win, bd, rdb);
                         else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 6)
+                            rdb_backup_extended(win, bd, rdb);
+                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 7)
                             rdb_restore_extended(win, bd);
                         mcode = it->NextSelect;
                     }

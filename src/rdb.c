@@ -131,49 +131,6 @@ void BlockDev_Close(struct BlockDev *bd)
 
 BOOL BlockDev_ReadBlock(struct BlockDev *bd, ULONG blocknum, void *buf)
 {
-    BYTE err;
-
-    /* Try HD_SCSICMD READ(10) first — bypasses the scsi.device read cache
-       so we see what is physically on disk after an HD_SCSICMD write.
-       Falls through to CMD_READ on IOERR_NOCMD (non-SCSI devices). */
-    {
-        struct SCSICmd scmd;
-        UBYTE cdb[10];
-        cdb[0] = 0x28;                      /* READ(10) */
-        cdb[1] = 0x00;
-        cdb[2] = (UBYTE)(blocknum >> 24);
-        cdb[3] = (UBYTE)(blocknum >> 16);
-        cdb[4] = (UBYTE)(blocknum >>  8);
-        cdb[5] = (UBYTE)(blocknum);
-        cdb[6] = 0x00;
-        cdb[7] = 0x00;
-        cdb[8] = 0x01;
-        cdb[9] = 0x00;
-
-        scmd.scsi_Data        = (UWORD *)buf;
-        scmd.scsi_Length      = bd->block_size;
-        scmd.scsi_Actual      = 0;
-        scmd.scsi_Command     = cdb;
-        scmd.scsi_CmdLength   = 10;
-        scmd.scsi_CmdActual   = 0;
-        scmd.scsi_Flags       = SCSIF_READ;
-        scmd.scsi_Status      = 0;
-        scmd.scsi_SenseData   = NULL;
-        scmd.scsi_SenseLength = 0;
-        scmd.scsi_SenseActual = 0;
-
-        bd->iotd.iotd_Req.io_Command = HD_SCSICMD;
-        bd->iotd.iotd_Req.io_Length  = sizeof(scmd);
-        bd->iotd.iotd_Req.io_Data    = (APTR)&scmd;
-        bd->iotd.iotd_Req.io_Flags   = 0;
-        bd->iotd.iotd_Count          = 0;
-        err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
-        bd->last_hd_read_err = err;
-        if (err == 0) return TRUE;
-        if (err != IOERR_NOCMD) return FALSE;
-        /* IOERR_NOCMD: not a SCSI device — fall through to CMD_READ */
-    }
-
     bd->iotd.iotd_Req.io_Command = CMD_READ;
     bd->iotd.iotd_Req.io_Length  = bd->block_size;
     bd->iotd.iotd_Req.io_Data    = buf;
@@ -327,6 +284,23 @@ void FormatSize(UQUAD bytes, char *buf)
 }
 
 /* ------------------------------------------------------------------ */
+/* read2 — read a block twice into the same chip-RAM buf              */
+/*                                                                     */
+/* On the A3000 built-in scsi.device (WD33C93 + SDMAC), the first     */
+/* CMD_READ for any given (block, buffer-address) pair may return      */
+/* partially-corrupted data — the block ID bytes (0-3) are typically   */
+/* correct but fields at higher offsets (e.g. DosEnvec at +128) may   */
+/* contain stale DMA FIFO contents.  An IMMEDIATE second read of the  */
+/* SAME block into the SAME address reliably returns correct data.     */
+/* ------------------------------------------------------------------ */
+
+static BOOL read2(struct BlockDev *bd, ULONG blocknum, UBYTE *buf)
+{
+    BlockDev_ReadBlock(bd, blocknum, buf);          /* prime — discard */
+    return BlockDev_ReadBlock(bd, blocknum, buf);   /* stable read     */
+}
+
+/* ------------------------------------------------------------------ */
 /* RDB_Read                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -340,29 +314,22 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
     memset(rdb, 0, sizeof(*rdb));
     rdb->valid = FALSE;
 
-    buf = (UBYTE *)AllocVec(512, MEMF_CHIP);
+    buf = (UBYTE *)AllocVec(512, MEMF_CHIP | MEMF_CLEAR);
     if (!buf)
         return FALSE;
 
-    /* Scan first RDB_SCAN_LIMIT blocks for RDSK signature */
+    /* Scan first RDB_SCAN_LIMIT blocks for RDSK signature.
+       read2() reads each candidate block TWICE in immediate succession;
+       on the A3000 SDMAC the first read of any block may return stale
+       FIFO data but the second consecutive read is always stable. */
     for (blk = 0; blk < RDB_SCAN_LIMIT; blk++) {
-        if (!BlockDev_ReadBlock(bd, blk, buf))
+        if (!read2(bd, blk, buf))
             continue;
         rdsk = (struct RigidDiskBlock *)buf;
         if (rdsk->rdb_ID != IDNAME_RIGIDDISK)
             continue;
 
-        /* Sanity-check the critical geometry fields before accepting this
-           block.  The RDSK ID alone is not enough — some partially-written
-           or corrupt blocks have a correct ID but garbage in every other
-           field.  Requiring plausible geometry catches those cases while
-           still accepting blocks whose checksums are wrong but whose data
-           is otherwise correct (e.g., certain older HDToolBox versions). */
-        if (rdsk->rdb_BlockBytes == 0 || rdsk->rdb_BlockBytes > 65536)
-            continue;
-        if (rdsk->rdb_Heads    == 0 || rdsk->rdb_Heads    > 255)  continue;
-        if (rdsk->rdb_Sectors  == 0 || rdsk->rdb_Sectors  > 255)  continue;
-        if (rdsk->rdb_Cylinders == 0 || rdsk->rdb_Cylinders > 0x100000) continue;
+        /* Accept any block whose ID is RDSK. */
 
         rdb->valid       = TRUE;
         rdb->block_num   = blk;
@@ -374,6 +341,19 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         rdb->rdb_block_hi= rdsk->rdb_RDBBlocksHi;
         rdb->lo_cyl      = rdsk->rdb_LoCylinder;
         rdb->hi_cyl      = rdsk->rdb_HiCylinder;
+
+        /* Sanitize lo_cyl/hi_cyl: some tools write garbage here.
+           If they are clearly wrong (reversed, or beyond the disk),
+           derive sensible values from rdb_Cylinders instead. */
+        if (rdb->cylinders > 0 &&
+            (rdb->lo_cyl >= rdb->cylinders ||
+             rdb->hi_cyl >= rdb->cylinders ||
+             rdb->lo_cyl >  rdb->hi_cyl))
+        {
+            rdb->lo_cyl = 1;                    /* cyl 0 holds the RDB */
+            rdb->hi_cyl = rdb->cylinders - 1;
+        }
+
         rdb->part_list   = rdsk->rdb_PartitionList;
         rdb->fshdr_list  = rdsk->rdb_FileSysHeaderList;
 
@@ -389,6 +369,17 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
     }
 
     /* Walk partition linked list */
+    /* Debug: probe the first partition block before the loop */
+    rdb->dbg_part_read = FALSE;
+    rdb->dbg_part_id   = 0;
+    if (rdb->part_list != RDB_END_MARK) {
+        if (read2(bd, rdb->part_list, buf)) {
+            rdb->dbg_part_read = TRUE;
+            rdb->dbg_part_id   = ((ULONG)buf[0]<<24)|((ULONG)buf[1]<<16)|
+                                  ((ULONG)buf[2]<<8)|(ULONG)buf[3];
+        }
+    }
+
     next = rdb->part_list;
     while (next != RDB_END_MARK && rdb->num_parts < MAX_PARTITIONS) {
         ULONG *env;
@@ -396,7 +387,7 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         UBYTE  len;
         struct PartInfo *pi;
 
-        if (!BlockDev_ReadBlock(bd, next, buf))
+        if (!read2(bd, next, buf))
             break;
         pb = (struct PartitionBlock *)buf;
         if (pb->pb_ID != IDNAME_PARTITION)
@@ -443,7 +434,7 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         ULONG lseg_blk;
         ULONG num_lseg;
 
-        if (!BlockDev_ReadBlock(bd, next, buf))
+        if (!read2(bd, next, buf))
             break;
         fhb = (struct FileSysHeaderBlock *)buf;
         if (fhb->fhb_ID != IDNAME_FSHEADER)

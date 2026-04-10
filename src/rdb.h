@@ -124,6 +124,8 @@ struct RDBInfo {
     char  disk_revision[5];
     UWORD num_parts;
     UWORD num_fs;
+    ULONG dbg_part_id;     /* pb_ID of first PART block read (debug) */
+    BOOL  dbg_part_read;   /* TRUE if BlockDev_ReadBlock(part_list) succeeded */
     struct PartInfo parts[MAX_PARTITIONS];
     struct FSInfo   filesystems[MAX_FILESYSTEMS];
 };
