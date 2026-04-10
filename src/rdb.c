@@ -173,10 +173,20 @@ void FormatDosType(ULONG dostype, char *buf)
 
 void FormatSize(UQUAD bytes, char *buf)
 {
-    if      (bytes >= (UQUAD)1024*1024*1024) sprintf(buf, "%lu GB", (unsigned long)(bytes / (1024*1024*1024)));
-    else if (bytes >= (UQUAD)1024*1024)      sprintf(buf, "%lu MB", (unsigned long)(bytes / (1024*1024)));
-    else if (bytes >= (UQUAD)1024)           sprintf(buf, "%lu KB", (unsigned long)(bytes / 1024));
-    else                                      sprintf(buf, "%lu B",  (unsigned long)bytes);
+    if (bytes >= (UQUAD)1024*1024*1024) {
+        unsigned long whole = (unsigned long)(bytes / ((UQUAD)1024*1024*1024));
+        unsigned long frac  = (unsigned long)((bytes % ((UQUAD)1024*1024*1024)) * 10 / ((UQUAD)1024*1024*1024));
+        if (frac) sprintf(buf, "%lu.%lu GB", whole, frac);
+        else      sprintf(buf, "%lu GB",     whole);
+    }
+    else if (bytes >= (UQUAD)1024*1024) {
+        unsigned long whole = (unsigned long)(bytes / ((UQUAD)1024*1024));
+        unsigned long frac  = (unsigned long)((bytes % ((UQUAD)1024*1024)) * 10 / ((UQUAD)1024*1024));
+        if (frac) sprintf(buf, "%lu.%lu MB", whole, frac);
+        else      sprintf(buf, "%lu MB",     whole);
+    }
+    else if (bytes >= (UQUAD)1024) sprintf(buf, "%lu KB", (unsigned long)(bytes / 1024));
+    else                            sprintf(buf, "%lu B",  (unsigned long)bytes);
 }
 
 /* ------------------------------------------------------------------ */
