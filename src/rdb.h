@@ -49,8 +49,6 @@ struct BlockDev {
     char             devname[64];
     ULONG            unit;
     BYTE             last_io_err;       /* io_Error from last WriteBlock call */
-    BYTE             last_hd_err;       /* io_Error from HD_SCSICMD write     */
-    BYTE             last_hd_read_err;  /* io_Error from HD_SCSICMD read      */
     ULONG            last_verify_block; /* block number that failed verify    */
     ULONG            last_verify_off;   /* byte offset of first mismatch      */
     UBYTE            last_wrote[4];     /* bytes at mismatch offset, written  */
@@ -67,6 +65,10 @@ BOOL             BlockDev_WriteBlock(struct BlockDev *bd, ULONG blocknum, const 
 
 /* Returns TRUE if block 0 has a PC MBR signature (0x55AA at offset 510). */
 BOOL             BlockDev_HasMBR(struct BlockDev *bd);
+
+/* Erase MBR partition table entries + boot signature from block 0.
+   Leaves boot code area (bytes 0-445) intact. */
+BOOL             BlockDev_EraseMBR(struct BlockDev *bd);
 
 /* ------------------------------------------------------------------ */
 /* In-memory partition / RDB info (filled by RDB_Read)                */

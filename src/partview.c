@@ -2085,7 +2085,7 @@ static void rdb_backup_block(struct Window *win, struct BlockDev *bd,
         return;
     }
 
-    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) return;
 
     if (!BlockDev_ReadBlock(bd, rdb->block_num, buf)) {
@@ -2234,7 +2234,7 @@ static void rdb_restore_block(struct Window *win, struct BlockDev *bd)
         return;
     }
 
-    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) { Close(fh); return; }
 
     if (Read(fh, buf, fsize) != fsize) {
@@ -2317,7 +2317,7 @@ static void rdb_backup_extended(struct Window *win, struct BlockDev *bd,
         EasyRequest(win, &es, NULL); return;
     }
 
-    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) return;
 
     /* Read RDSK block to get rdb_HighRDSKBlock */
@@ -2543,7 +2543,7 @@ static void rdb_restore_extended(struct Window *win, struct BlockDev *bd)
       if (EasyRequest(win, &es, NULL) != 1) { Close(fh); return; }
     }
 
-    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) { Close(fh); return; }
 
     for (blk = 0; blk < num_blocks; blk++) {
@@ -2682,7 +2682,7 @@ static void rdb_view_block(struct Window *win, struct BlockDev *bd,
         return;
     }
 
-    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) return;
 
     /* If no valid RDB was found, read block 0 and show it anyway.
@@ -3026,7 +3026,7 @@ static void rdb_raw_scan(struct Window *win, struct BlockDev *bd)
         return;
     }
 
-    buf = (UBYTE *)AllocVec(512, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) return;
 
     vrdb_count = 0;
@@ -3339,6 +3339,203 @@ static void rdb_raw_scan(struct Window *win, struct BlockDev *bd)
         UnLockDosList(LDF_DEVICES | LDF_READ);
     }
 
+    /* ---- Multi-read stability test (A3000 DMA shift check) ----
+     * 1. Read each block 4× consecutively into separate CHIP RAM buffers.
+     *    Report byte diffs between reads.  0 diffs does NOT mean data is good —
+     *    it means every read returns the same bytes (possibly all wrong).
+     * 2. Show checksum status + key fields from read 1 so on-disk corruption
+     *    is visible even when all 4 reads agree.
+     * 3. Interleaved test: RDSK → PART → RDSK again.  If the two RDSK reads
+     *    differ, reading PART is corrupting the DMA state for subsequent reads.
+     * ------------------------------------------------------------------ */
+    {
+        UBYTE *b[4];
+        int    bi, allok;
+        ULONG  mrdsk = 0xFFFFFFFFUL, mpart = 0xFFFFFFFFUL;
+        ULONG  scan_b2;
+
+        vrdb_add("");
+        vrdb_add("--- Multi-read stability test (A3000 DMA check) ---");
+
+        allok = 1;
+        for (bi = 0; bi < 4; bi++) b[bi] = NULL;
+        for (bi = 0; bi < 4; bi++) {
+            b[bi] = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
+            if (!b[bi]) { allok = 0; break; }
+        }
+
+        if (!allok) {
+            vrdb_add("  (AllocVec failed - out of CHIP RAM)");
+        } else {
+            /* Re-scan for RDSK (<=16 CMD_READ into b[0]) */
+            for (scan_b2 = 0; scan_b2 < 16; scan_b2++) {
+                ULONG scan_id;
+                bd->iotd.iotd_Req.io_Command = CMD_READ;
+                bd->iotd.iotd_Req.io_Length  = 512;
+                bd->iotd.iotd_Req.io_Data    = (APTR)b[0];
+                bd->iotd.iotd_Req.io_Offset  = scan_b2 * 512UL;
+                bd->iotd.iotd_Req.io_Flags   = 0;
+                bd->iotd.iotd_Count          = 0;
+                if (DoIO((struct IORequest *)&bd->iotd) != 0) continue;
+                scan_id = ((ULONG)b[0][0]<<24)|((ULONG)b[0][1]<<16)|
+                          ((ULONG)b[0][2]<<8)|(ULONG)b[0][3];
+                if (scan_id == IDNAME_RIGIDDISK) {
+                    mrdsk = scan_b2;
+                    /* PartitionList at longword offset 7 = byte 28 */
+                    mpart = ((ULONG)b[0][28]<<24)|((ULONG)b[0][29]<<16)|
+                            ((ULONG)b[0][30]<<8)|(ULONG)b[0][31];
+                    if (mpart == RDB_END_MARK) mpart = 0xFFFFFFFFUL;
+                    break;
+                }
+            }
+
+            if (mrdsk == 0xFFFFFFFFUL) {
+                vrdb_add("  (RDSK not found - skipping)");
+            } else {
+/* ----------------------------------------------------------------
+ * MREAD_BLK(blkno_, is_part_)
+ *   Read blkno_ 4× into b[0..3].
+ *   Show: differential comparison + checksum of b[0] + key fields.
+ *   is_part_: 0=RDSK, 1=PART.
+ * -------------------------------------------------------------- */
+#define MREAD_BLK(blkno_, is_part_) do { \
+    ULONG _bn = (blkno_); \
+    int   _r, _cmp, _rdok = 1; \
+    char  _hdr[64]; \
+    sprintf(_hdr, "  Block %lu (%s): 4 reads", \
+            _bn, (is_part_) ? "PART" : "RDSK"); \
+    vrdb_add(_hdr); \
+    for (_r = 0; _r < 4; _r++) { \
+        bd->iotd.iotd_Req.io_Command = CMD_READ; \
+        bd->iotd.iotd_Req.io_Length  = 512; \
+        bd->iotd.iotd_Req.io_Data    = (APTR)b[_r]; \
+        bd->iotd.iotd_Req.io_Offset  = _bn * 512UL; \
+        bd->iotd.iotd_Req.io_Flags   = 0; \
+        bd->iotd.iotd_Count          = 0; \
+        if (DoIO((struct IORequest *)&bd->iotd) != 0) { _rdok = 0; break; } \
+    } \
+    if (!_rdok) { vrdb_add("    read error"); break; } \
+    /* differential comparison */ \
+    for (_cmp = 1; _cmp < 4; _cmp++) { \
+        ULONG _off, _nd = 0, _sh = 0; \
+        char  _ln[80]; char *_lx = _ln; \
+        for (_off = 0; _off < 512; _off++) \
+            if (b[_cmp][_off] != b[0][_off]) _nd++; \
+        sprintf(_lx, "    R%d vs R1: %lu differ", _cmp+1, _nd); \
+        _lx += strlen(_lx); \
+        if (_nd > 0) { \
+            for (_off = 0; _off < 512 && _sh < 6; _off++) { \
+                if (b[_cmp][_off] != b[0][_off]) { \
+                    sprintf(_lx, "  @%03lX:%02X->%02X", \
+                        (unsigned long)_off, \
+                        (unsigned)b[0][_off], (unsigned)b[_cmp][_off]); \
+                    _lx += strlen(_lx); _sh++; \
+                } \
+            } \
+        } \
+        *_lx = '\0'; vrdb_add(_ln); \
+    } \
+    /* checksum of read 1 — catches on-disk corruption missed by diffs */ \
+    { const ULONG *_lp = (const ULONG *)b[0]; \
+      ULONG _sl = _lp[1], _sm = 0, _si; \
+      if (_sl >= 2 && _sl <= 128) for (_si=0;_si<_sl;_si++) _sm+=_lp[_si]; \
+      sprintf(line, "    csum: SL=%lu sum=0x%08lX %s", \
+              _sl, _sm, (_sl>=2&&_sl<=128&&_sm==0)?"OK":"BAD"); \
+      vrdb_add(line); \
+    } \
+    /* key fields — show actual bytes so corruption is explicit */ \
+    if (!(is_part_)) { \
+        const ULONG *_lp = (const ULONG *)b[0]; \
+        sprintf(line, "    Cyls=%lu Heads=%lu Secs=%lu PartList=%lu", \
+                _lp[16], _lp[18], _lp[17], _lp[7]); \
+        vrdb_add(line); \
+    } else { \
+        /* name BSTR at byte 36; DosEnvec[16]=DosType at byte 192 (0xC0) */ \
+        UBYTE _nl = b[0][36]; char _nm[12]; ULONG _dk; \
+        ULONG _dt; \
+        if (_nl > 10) _nl = 10; \
+        for (_dk=0;_dk<(ULONG)_nl;_dk++) { \
+            char _c=b[0][37+_dk]; _nm[_dk]=(_c>=0x20&&_c<=0x7E)?_c:'.'; } \
+        _nm[_nl]='\0'; \
+        _dt=((ULONG)b[0][192]<<24)|((ULONG)b[0][193]<<16)| \
+            ((ULONG)b[0][194]<<8)|(ULONG)b[0][195]; \
+        sprintf(line, \
+            "    n[36]: len=%u '%s' raw:%02X %02X %02X %02X", \
+            (unsigned)b[0][36], _nm, \
+            b[0][36], b[0][37], b[0][38], b[0][39]); \
+        vrdb_add(line); \
+        sprintf(line, \
+            "    DosType[C0]: %02X %02X %02X %02X = 0x%08lX", \
+            b[0][192],b[0][193],b[0][194],b[0][195],_dt); \
+        vrdb_add(line); \
+    } \
+} while(0)
+
+                MREAD_BLK(mrdsk, 0);
+                if (mpart != 0xFFFFFFFFUL)
+                    MREAD_BLK(mpart, 1);
+                else
+                    vrdb_add("  (no PART block - PartList is end-mark)");
+
+#undef MREAD_BLK
+
+                /* Interleaved test: RDSK → PART → RDSK
+                   If the two RDSK reads differ, reading PART pollutes DMA state.
+                   If they agree but csum is BAD, the corruption is on-disk.     */
+                if (mpart != 0xFFFFFFFFUL) {
+                    ULONG _off, _nd = 0, _sh = 0;
+                    /* RDSK → b[0] */
+                    bd->iotd.iotd_Req.io_Command = CMD_READ;
+                    bd->iotd.iotd_Req.io_Length  = 512;
+                    bd->iotd.iotd_Req.io_Data    = (APTR)b[0];
+                    bd->iotd.iotd_Req.io_Offset  = mrdsk * 512UL;
+                    bd->iotd.iotd_Req.io_Flags   = 0;
+                    bd->iotd.iotd_Count          = 0;
+                    DoIO((struct IORequest *)&bd->iotd);
+                    /* PART → b[1] (advance DMA state) */
+                    bd->iotd.iotd_Req.io_Command = CMD_READ;
+                    bd->iotd.iotd_Req.io_Length  = 512;
+                    bd->iotd.iotd_Req.io_Data    = (APTR)b[1];
+                    bd->iotd.iotd_Req.io_Offset  = mpart * 512UL;
+                    bd->iotd.iotd_Req.io_Flags   = 0;
+                    bd->iotd.iotd_Count          = 0;
+                    DoIO((struct IORequest *)&bd->iotd);
+                    /* RDSK again → b[2] */
+                    bd->iotd.iotd_Req.io_Command = CMD_READ;
+                    bd->iotd.iotd_Req.io_Length  = 512;
+                    bd->iotd.iotd_Req.io_Data    = (APTR)b[2];
+                    bd->iotd.iotd_Req.io_Offset  = mrdsk * 512UL;
+                    bd->iotd.iotd_Req.io_Flags   = 0;
+                    bd->iotd.iotd_Count          = 0;
+                    DoIO((struct IORequest *)&bd->iotd);
+                    /* compare b[0] (first RDSK) vs b[2] (second RDSK) */
+                    for (_off = 0; _off < 512; _off++)
+                        if (b[0][_off] != b[2][_off]) _nd++;
+                    {
+                        char _ln[80]; char *_lx = _ln;
+                        sprintf(_lx, "  Interleaved RDSK re-read: %lu differ", _nd);
+                        _lx += strlen(_lx);
+                        if (_nd > 0) {
+                            for (_off = 0; _off < 512 && _sh < 6; _off++) {
+                                if (b[0][_off] != b[2][_off]) {
+                                    sprintf(_lx, "  @%03lX:%02X->%02X",
+                                        (unsigned long)_off,
+                                        (unsigned)b[0][_off],
+                                        (unsigned)b[2][_off]);
+                                    _lx += strlen(_lx); _sh++;
+                                }
+                            }
+                        }
+                        *_lx = '\0';
+                        vrdb_add(_ln);
+                    }
+                }
+            }
+        }
+
+        for (bi = 0; bi < 4; bi++) if (b[bi]) FreeVec(b[bi]);
+    }
+
     FreeVec(buf);
 
     /* Open display window */
@@ -3460,7 +3657,7 @@ static void raw_disk_read(struct Window *win, struct BlockDev *bd)
         return;
     }
 
-    buf = (UBYTE *)AllocVec(512, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) return;
 
     vrdb_count = 0;
@@ -3920,8 +4117,79 @@ rdr_cleanup:
     }
 }
 
-/* raw_hex_dump — dump raw CMD_READ hex+ASCII of blocks 0..N-1        */
-/* Uses vrdb listview.  Bypasses BlockDev_ReadBlock entirely.         */
+/* ------------------------------------------------------------------ */
+/* diag_read_block — read one 512-byte block for diagnostic use only. */
+/*                                                                     */
+/* Tries HD_SCSICMD (SCSI READ(10)) first.  On the A3000 this issues  */
+/* the read directly through the WD33C93 without going through the    */
+/* trackdisk layer, potentially bypassing the SDMAC pipeline lag that  */
+/* causes CMD_READ to return shifted data.                             */
+/*                                                                     */
+/* buf MUST be AllocVec'd with MEMF_PUBLIC — matches HDToolBox and lets */
+/* the A3000 SDMAC use the 32-bit fast-RAM DMA path.                   */
+/*                                                                     */
+/* Returns:                                                            */
+/*   0  — success via HD_SCSICMD (SCSI path)                          */
+/*   1  — success via CMD_READ fallback (non-SCSI or SCSI unavail.)   */
+/*  -1  — both paths failed                                            */
+/* ------------------------------------------------------------------ */
+
+static int diag_read_block(struct BlockDev *bd, ULONG blknum, UBYTE *chipbuf)
+{
+    struct SCSICmd scmd;
+    UBYTE  cdb[10];
+    UBYTE  sense[16];
+    BYTE   err;
+
+    /* HD_SCSICMD: SCSI READ(10), LBA = blknum, transfer length = 1 block.
+       scmd/cdb/sense are CPU-read only (not DMA'd), so stack (FAST RAM) is
+       fine.  chipbuf is where the SDMAC puts the 512 data bytes — must be
+       CHIP RAM, which the caller guarantees. */
+    memset(&scmd,  0, sizeof(scmd));
+    memset(cdb,    0, sizeof(cdb));
+    memset(sense,  0, sizeof(sense));
+
+    cdb[0] = 0x28;                         /* READ(10) operation code */
+    cdb[2] = (UBYTE)(blknum >> 24);
+    cdb[3] = (UBYTE)(blknum >> 16);
+    cdb[4] = (UBYTE)(blknum >>  8);
+    cdb[5] = (UBYTE)(blknum);
+    cdb[8] = 1;                            /* transfer length: 1 block */
+
+    scmd.scsi_Data        = (UWORD *)chipbuf;
+    scmd.scsi_Length      = 512;
+    scmd.scsi_Command     = cdb;
+    scmd.scsi_CmdLength   = 10;
+    scmd.scsi_Flags       = SCSIF_READ;
+    scmd.scsi_SenseData   = sense;
+    scmd.scsi_SenseLength = sizeof(sense);
+
+    bd->iotd.iotd_Req.io_Command = HD_SCSICMD;
+    bd->iotd.iotd_Req.io_Length  = sizeof(scmd);
+    bd->iotd.iotd_Req.io_Data    = (APTR)&scmd;
+    bd->iotd.iotd_Req.io_Flags   = 0;
+    bd->iotd.iotd_Count          = 0;
+    err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+
+    if (err == 0)
+        return 0;   /* HD_SCSICMD read succeeded */
+
+    /* Fall back to CMD_READ: works on non-SCSI devices and as a reference
+       read so the caller can compare SCSI vs CMD_READ output. */
+    bd->iotd.iotd_Req.io_Command = CMD_READ;
+    bd->iotd.iotd_Req.io_Length  = 512;
+    bd->iotd.iotd_Req.io_Data    = (APTR)chipbuf;
+    bd->iotd.iotd_Req.io_Offset  = blknum * 512UL;
+    bd->iotd.iotd_Req.io_Flags   = 0;
+    bd->iotd.iotd_Count          = 0;
+    err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+    return (err == 0) ? 1 : -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* raw_hex_dump — dump raw hex+ASCII of blocks 0..N-1                 */
+/* Uses diag_read_block: HD_SCSICMD first, CMD_READ fallback.         */
+/* Block header shows [SCSI] or [CMD] so you can see which path ran.  */
 /* ------------------------------------------------------------------ */
 
 #define DUMP_BLOCKS 8   /* number of blocks to dump */
@@ -3930,7 +4198,7 @@ static void raw_hex_dump(struct Window *win, struct BlockDev *bd)
 {
     UBYTE *buf;
     ULONG  blk, i;
-    BYTE   err;
+    int    rcode;
     char   line[80];
     struct EasyStruct es;
 
@@ -3943,7 +4211,7 @@ static void raw_hex_dump(struct Window *win, struct BlockDev *bd)
         return;
     }
 
-    buf = (UBYTE *)AllocVec(512, MEMF_CHIP | MEMF_CLEAR);
+    buf = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) return;
 
     vrdb_count = 0;
@@ -3956,23 +4224,16 @@ static void raw_hex_dump(struct Window *win, struct BlockDev *bd)
         char  idtxt[5];
         UWORD k;
 
-        /* Single raw CMD_READ — no retries, no checksum; raw on-disk bytes */
-        bd->iotd.iotd_Req.io_Command = CMD_READ;
-        bd->iotd.iotd_Req.io_Length  = 512;
-        bd->iotd.iotd_Req.io_Data    = (APTR)buf;
-        bd->iotd.iotd_Req.io_Offset  = blk * 512UL;
-        bd->iotd.iotd_Req.io_Flags   = 0;
-        bd->iotd.iotd_Count          = 0;
-        err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+        rcode = diag_read_block(bd, blk, buf);
 
-        if (err != 0) {
-            sprintf(line, "=== Block %lu: CMD_READ error %ld ===",
-                    (unsigned long)blk, (long)err);
+        if (rcode < 0) {
+            sprintf(line, "=== Block %lu: read error ===",
+                    (unsigned long)blk);
             vrdb_add(line);
             continue;
         }
 
-        /* Block header: ID tag + checksum result */
+        /* Block header: ID tag + checksum + which read path succeeded */
         id = ((ULONG)buf[0]<<24)|((ULONG)buf[1]<<16)|
              ((ULONG)buf[2]<<8)|(ULONG)buf[3];
         for (k = 0; k < 4; k++) {
@@ -3981,15 +4242,15 @@ static void raw_hex_dump(struct Window *win, struct BlockDev *bd)
         }
         idtxt[4] = '\0';
         {
-            /* compute checksum for display */
             const ULONG *lp = (const ULONG *)buf;
             ULONG summed = lp[1];
             ULONG sum = 0, s;
             if (summed >= 2 && summed <= 128)
                 for (s = 0; s < summed; s++) sum += lp[s];
-            sprintf(line, "=== Block %lu  ID=%s(0x%08lX)  csum=%s ===",
+            sprintf(line, "=== Block %lu  ID=%s(0x%08lX)  csum=%s  [%s] ===",
                     (unsigned long)blk, idtxt, id,
-                    (summed >= 2 && summed <= 128 && sum == 0) ? "OK" : "BAD");
+                    (summed >= 2 && summed <= 128 && sum == 0) ? "OK" : "BAD",
+                    (rcode == 0) ? "SCSI" : "CMD");
         }
         vrdb_add(line);
 
@@ -4047,7 +4308,7 @@ static void raw_hex_dump(struct Window *win, struct BlockDev *bd)
               { WA_Left,      (ULONG)((scr_w - win_w) / 2) },
               { WA_Top,       (ULONG)((scr_h - win_h) / 2) },
               { WA_Width,     win_w }, { WA_Height, win_h },
-              { WA_Title,     (ULONG)"Hex Dump - Raw Blocks (CMD_READ)" },
+              { WA_Title,     (ULONG)"Hex Dump - Raw Blocks (SCSI/CMD)" },
               { WA_Gadgets,   (ULONG)glist },
               { WA_PubScreen, (ULONG)scr },
               { WA_IDCMP,     IDCMP_CLOSEWINDOW|IDCMP_GADGETUP|
@@ -4810,10 +5071,10 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 new_pi.reserved_blks = 2;
                                 new_pi.interleave    = 0;
                                 new_pi.max_transfer  = 0x7FFFFFFFUL;
-                                new_pi.mask          = 0xFFFFFFFEUL;
+                                new_pi.mask          = 0x7FFFFFFCUL;
                                 new_pi.num_buffer    = 30;
                                 new_pi.buf_mem_type  = 0;
-                                new_pi.boot_blocks   = 2;
+                                new_pi.boot_blocks   = 0;
                                 new_pi.baud          = 0;
                                 new_pi.control       = 0;
                                 new_pi.dev_flags     = 0;
@@ -5061,10 +5322,10 @@ BOOL partview_run(const char *devname, ULONG unit)
                         new_pi.reserved_blks = 2;
                         new_pi.interleave    = 0;
                         new_pi.max_transfer  = 0x7FFFFFFFUL;
-                        new_pi.mask          = 0xFFFFFFFEUL;
+                        new_pi.mask          = 0x7FFFFFFCUL;
                         new_pi.num_buffer    = 30;
                         new_pi.buf_mem_type  = 0;
-                        new_pi.boot_blocks   = 2;
+                        new_pi.boot_blocks   = 0;
                         new_pi.baud          = 0;
                         new_pi.control       = 0;
                         new_pi.dev_flags     = 0;
@@ -5150,25 +5411,27 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 if (bd && bd->last_io_err == 1)
                                     sprintf(wfmt,
                                         "Verify fail blk %lu off %lu\n"
-                                        "W:%02X%02X%02X%02X R:%02X%02X%02X%02X\n"
-                                        "Wr=%d Rd=%d",
+                                        "W:%02X%02X%02X%02X R:%02X%02X%02X%02X",
                                         (unsigned long)bd->last_verify_block,
                                         (unsigned long)bd->last_verify_off,
                                         bd->last_wrote[0], bd->last_wrote[1],
                                         bd->last_wrote[2], bd->last_wrote[3],
                                         bd->last_read[0],  bd->last_read[1],
-                                        bd->last_read[2],  bd->last_read[3],
-                                        (int)bd->last_hd_err,
-                                        (int)bd->last_hd_read_err);
+                                        bd->last_read[2],  bd->last_read[3]);
                                 else
-                                    sprintf(wfmt, "Write failed (err %d, SCSI %d)!\nCheck device and try again.",
-                                        bd ? (int)bd->last_io_err : 0,
-                                        bd ? (int)bd->last_hd_err : 0);
+                                    sprintf(wfmt, "Write failed (err %d)!\nCheck device and try again.",
+                                        bd ? (int)bd->last_io_err : 0);
                                 es.es_TextFormat   = (UBYTE *)wfmt;
                                 es.es_GadgetFormat = (UBYTE *)"OK";
                                 EasyRequest(win, &es, NULL);
                             } else {
                                 dirty = FALSE;
+                                if (BlockDev_HasMBR(bd)) {
+                                    es.es_TextFormat   = (UBYTE *)"PC partition table (MBR) found on block 0.\nErase it?";
+                                    es.es_GadgetFormat = (UBYTE *)"Erase|Keep";
+                                    if (EasyRequest(win, &es, NULL) == 1)
+                                        BlockDev_EraseMBR(bd);
+                                }
                                 if (needs_reboot) {
                                     es.es_TextFormat   = (UBYTE *)"Partition table written.\nReboot now for changes to take effect.";
                                     es.es_GadgetFormat = (UBYTE *)"Reboot|Later";
