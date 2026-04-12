@@ -53,6 +53,7 @@ struct BlockDev {
     ULONG            last_verify_off;   /* byte offset of first mismatch      */
     UBYTE            last_wrote[4];     /* bytes at mismatch offset, written  */
     UBYTE            last_read[4];      /* bytes at mismatch offset, on disk  */
+    char             disk_brand[36];    /* vendor+product from SCSI INQUIRY   */
 };
 
 /* Open/close a block device for probing or RDB I/O. */

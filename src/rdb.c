@@ -110,6 +110,56 @@ struct BlockDev *BlockDev_Open(const char *devname, ULONG unit)
                       ? (UQUAD)geom.dg_TotalSectors * 512UL
                       : 0;
 
+    /* SCSI INQUIRY to get vendor/product for display (best effort) */
+    {
+        struct SCSICmd scmd;
+        UBYTE cdb[6];
+        UBYTE *inq = (UBYTE *)AllocVec(36, MEMF_PUBLIC | MEMF_CLEAR);
+        if (inq) {
+            memset(&scmd, 0, sizeof(scmd));
+            memset(cdb,   0, sizeof(cdb));
+            cdb[0] = 0x12;  /* INQUIRY */
+            cdb[4] = 36;    /* allocation length */
+
+            scmd.scsi_Data        = (UWORD *)inq;
+            scmd.scsi_Length      = 36;
+            scmd.scsi_Command     = cdb;
+            scmd.scsi_CmdLength   = 6;
+            scmd.scsi_Flags       = SCSIF_READ;
+
+            bd->iotd.iotd_Req.io_Command = HD_SCSICMD;
+            bd->iotd.iotd_Req.io_Length  = sizeof(scmd);
+            bd->iotd.iotd_Req.io_Data    = (APTR)&scmd;
+            bd->iotd.iotd_Req.io_Flags   = 0;
+            bd->iotd.iotd_Count          = 0;
+
+            if (DoIO((struct IORequest *)&bd->iotd) == 0) {
+                /* bytes 8-15: vendor (8 chars), 16-31: product (16 chars) */
+                char vendor[9], product[17];
+                WORD last;
+
+                memcpy(vendor,  inq + 8,  8);  vendor[8]   = '\0';
+                memcpy(product, inq + 16, 16); product[16] = '\0';
+
+                /* trim trailing spaces from vendor */
+                for (last = 7; last >= 0 && vendor[last] == ' '; last--)
+                    vendor[last] = '\0';
+                /* trim trailing spaces from product */
+                for (last = 15; last >= 0 && product[last] == ' '; last--)
+                    product[last] = '\0';
+
+                if (vendor[0] && product[0])
+                    sprintf(bd->disk_brand, "%s %s", vendor, product);
+                else if (product[0])
+                    strncpy(bd->disk_brand, product, 35);
+                else if (vendor[0])
+                    strncpy(bd->disk_brand, vendor, 35);
+                bd->disk_brand[35] = '\0';
+            }
+            FreeVec(inq);
+        }
+    }
+
     return bd;
 }
 

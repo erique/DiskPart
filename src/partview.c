@@ -8,8 +8,8 @@
  *   │  [RDB] [DH0────────] [DH1────────] [free  ·····]    │
  *   │  Cyl 0            Free: 250 MB           Cyl 1039   │
  *   ├─ Partitions ────────────────────────────────────────┤
- *   │  Drive   Lo Cyl  Hi Cyl  Filesystem    Size   Boot  │
- *   │  DH0          1     519  FFS         250 MB       0 │
+ *   │  Drive    Lo Cyl    Hi Cyl  Filesystem       Size Boot │
+ *   │  DH0            1       519  FFS          250 MB    0 │
  *   ├─ Buttons ───────────────────────────────────────────┤
  *   │  [Init RDB] [Add] [Edit] [Delete]          [Back]   │
  *   └─────────────────────────────────────────────────────┘
@@ -94,9 +94,17 @@ static const UBYTE PART_B[NUM_PART_COLORS]={0xD9,0x22,0x60,0xAD,0x3C,0x85,0x12,0
 /* Partition list strings (columnar, monospace-friendly)               */
 /* ------------------------------------------------------------------ */
 
-/* Column header drawn just above the listview gadget */
+/* Column header drawn just above the listview gadget.
+   Must match the sprintf format in build_part_list exactly:
+   "%c %-7s %9lu %9lu  %-12s  %9s   %4ld"
+   Col:  0    1   2-8   9  10-18  19  20-28  29-30  31-42  43-44  45-53  54-56  57-60
+         mk   sp  Drv   sp  LoCyl  sp  HiCyl   sp    FS     sp     Size    sp    Boot
+   LoCyl/HiCyl/Size right-aligned; FileSystem/Boot left-aligned.
+   Size header shifted 3 left of its data field for visual spacing.            */
 static const char PART_HDR[] =
-    "  Drive   Lo Cyl Hi Cyl  FileSystem       Size  Boot";
+/*  0         1         2         3         4         5         6    */
+/*  0123456789012345678901234567890123456789012345678901234567890123456789 */
+    "  Drive      Lo Cyl    Hi Cyl  FileSystem      Size      Boot";
 
 static char        part_strs[MAX_PARTITIONS][80];
 static struct Node part_nodes[MAX_PARTITIONS];
@@ -132,7 +140,7 @@ static void build_part_list(struct RDBInfo *rdb, WORD sel)
         FormatSize(bytes, sz);
 
         /* ">" marker for selected row, space otherwise */
-        sprintf(part_strs[i], "%c %-7s %6lu  %6lu  %-12s  %7s  %4ld",
+        sprintf(part_strs[i], "%c %-7s %9lu %9lu  %-12s  %9s   %4ld",
                 ((WORD)i == sel) ? '>' : ' ',
                 nm,
                 (unsigned long)pi->low_cyl,
@@ -505,7 +513,7 @@ static void draw_new_part_overlay(struct Window *win,
 /* ------------------------------------------------------------------ */
 
 static void draw_info(struct Window *win, const char *devname, ULONG unit,
-                      struct RDBInfo *rdb,
+                      struct RDBInfo *rdb, const char *brand,
                       WORD ix, WORD iy, UWORD iw)
 {
     struct RastPort *rp = win->RPort;
@@ -537,7 +545,7 @@ static void draw_info(struct Window *win, const char *devname, ULONG unit,
     }
 
     if (rdb && rdb->valid) {
-        char model[32], fsz[16];
+        char model[36], fsz[16];
         ULONG free_cyls = rdb->hi_cyl - rdb->lo_cyl + 1;
         UQUAD free_bytes;
         UWORD fi;
@@ -549,19 +557,27 @@ static void draw_info(struct Window *win, const char *devname, ULONG unit,
         free_bytes = (UQUAD)free_cyls * rdb->heads * rdb->sectors * 512UL;
         FormatSize(free_bytes, fsz);
 
+        /* prefer live SCSI INQUIRY brand; fall back to RDB-stored strings */
         model[0] = '\0';
-        if (rdb->disk_vendor[0] || rdb->disk_product[0])
+        if (brand && brand[0])
+            strncpy(model, brand, 35);
+        else if (rdb->disk_vendor[0] || rdb->disk_product[0])
             sprintf(model, "%s %s", rdb->disk_vendor, rdb->disk_product);
+        model[35] = '\0';
 
         if (model[0])
-            sprintf(line2, "Model: %-20s  RDB: %u partition%s  Free: %s",
+            sprintf(line2, "Model: %-20sRDB: %u partition%s     Free: %s",
                     model, (unsigned)rdb->num_parts,
                     rdb->num_parts == 1 ? "" : "s", fsz);
         else
-            sprintf(line2, "RDB: %u part  Free: %s",
+            sprintf(line2, "RDB: %u part     Free: %s",
                     (unsigned)rdb->num_parts, fsz);
     } else {
-        sprintf(line2, "RDB: Not found  (disk is unpartitioned)");
+        /* No valid RDB — still show brand if we have one */
+        if (brand && brand[0])
+            sprintf(line2, "Model: %-24sRDB: Not found", brand);
+        else
+            sprintf(line2, "RDB: Not found  (disk is unpartitioned)");
     }
 
     /* Clip line1 to window width */
@@ -611,13 +627,13 @@ static void draw_col_header(struct Window *win, WORD hx, WORD hy, UWORD hw)
 /* ------------------------------------------------------------------ */
 
 static void draw_static(struct Window *win, const char *devname, ULONG unit,
-                         struct RDBInfo *rdb,
+                         struct RDBInfo *rdb, const char *brand,
                          WORD ix, WORD iy, UWORD iw,   /* info section */
                          WORD bx, WORD by, UWORD bw, UWORD bh, /* map */
                          WORD hx, WORD hy, UWORD hw,   /* col header */
                          WORD sel)
 {
-    draw_info(win, devname, unit, rdb, ix, iy, iw);
+    draw_info(win, devname, unit, rdb, brand, ix, iy, iw);
     draw_map (win, rdb, sel, bx, by, bw, bh);
     draw_col_header(win, hx, hy, hw);
 }
@@ -646,6 +662,35 @@ static void sync_listview_sel(struct Window *win, struct Gadget *lv_gad,
 /* ------------------------------------------------------------------ */
 /* Free cylinder range                                                 */
 /* ------------------------------------------------------------------ */
+
+/* Find the lowest N such that "DH<N>" is not already used by any partition
+   in this RDB. Comparison is case-insensitive (AmigaOS names are uppercase
+   by convention but guard against mixed-case entries). */
+static void next_drive_name(const struct RDBInfo *rdb, char *buf)
+{
+    ULONG n;
+    for (n = 0; n <= MAX_PARTITIONS; n++) {
+        UWORD k;
+        BOOL  taken = FALSE;
+        char  cand[8];
+        UWORD ci;
+        sprintf(cand, "DH%lu", n);
+        for (k = 0; k < rdb->num_parts; k++) {
+            const char *ex = rdb->parts[k].drive_name;
+            /* Case-insensitive compare */
+            for (ci = 0; ; ci++) {
+                char a = cand[ci], b = ex[ci];
+                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+                if (a != b) break;
+                if (a == '\0') { taken = TRUE; break; }
+            }
+            if (taken) break;
+        }
+        if (!taken) { strncpy(buf, cand, 31); buf[31] = '\0'; return; }
+    }
+    strncpy(buf, "DH0", 31);   /* fallback, shouldn't happen */
+}
 
 static void find_free_range(const struct RDBInfo *rdb, ULONG *lo, ULONG *hi)
 {
@@ -1948,17 +1993,54 @@ static BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
                     case FSDLG_DELETE:
                         if (sel >= 0 && sel < (WORD)rdb->num_fs) {
                             struct EasyStruct es;
-                            char msg[64];
+                            char msg[256];
                             char dt[16];
-                            FormatDosType(rdb->filesystems[sel].dos_type, dt);
-                            sprintf(msg, "Delete filesystem driver %s?", dt);
-                            es.es_StructSize  =sizeof(es);
-                            es.es_Flags       =0;
-                            es.es_Title       =(UBYTE*)"Delete FS Driver";
-                            es.es_TextFormat  =(UBYTE*)msg;
-                            es.es_GadgetFormat=(UBYTE*)"Yes|No";
+                            char users[128];
+                            ULONG del_dt = rdb->filesystems[sel].dos_type;
+                            UWORD k, num_users = 0;
+                            char *up = users;
+                            users[0] = '\0';
+
+                            /* Find which partitions use this filesystem */
+                            for (k = 0; k < rdb->num_parts; k++) {
+                                if (rdb->parts[k].dos_type == del_dt) {
+                                    ULONG rem = (ULONG)(sizeof(users) - (ULONG)(up - users) - 1);
+                                    if (num_users > 0 && rem > 2)
+                                        { *up++=','; *up++=' '; *up='\0'; rem-=2; }
+                                    if (rem > 1) {
+                                        strncpy(up, rdb->parts[k].drive_name, rem);
+                                        up[rem] = '\0';
+                                        while (*up) up++;
+                                    }
+                                    num_users++;
+                                }
+                            }
+
+                            FriendlyDosType(del_dt, dt);
+                            if (num_users > 0) {
+                                sprintf(msg,
+                                    "Filesystem %s is in use by:\n"
+                                    "%s\n\n"
+                                    "Affected partition(s) will be\n"
+                                    "changed to FFS. Delete anyway?",
+                                    dt, users);
+                            } else {
+                                sprintf(msg, "Delete filesystem driver %s?", dt);
+                            }
+
+                            es.es_StructSize  = sizeof(es);
+                            es.es_Flags       = 0;
+                            es.es_Title       = (UBYTE*)"Delete FS Driver";
+                            es.es_TextFormat  = (UBYTE*)msg;
+                            es.es_GadgetFormat = (UBYTE*)"Yes|No";
                             if (EasyRequest(win, &es, NULL) == 1) {
                                 UWORD j;
+                                /* Reset affected partitions to FFS */
+                                for (k = 0; k < rdb->num_parts; k++) {
+                                    if (rdb->parts[k].dos_type == del_dt)
+                                        rdb->parts[k].dos_type = 0x444F5301UL;
+                                }
+                                /* Remove filesystem entry */
                                 if (rdb->filesystems[sel].code)
                                     FreeVec(rdb->filesystems[sel].code);
                                 for (j=(UWORD)sel; j+1 < rdb->num_fs; j++)
@@ -2436,12 +2518,31 @@ static void rdb_backup_extended(struct Window *win, struct BlockDev *bd,
         EasyRequest(win, &es, NULL); return;
     }
 
+    /* Build suggested filename from disk product name.
+       Spaces → '_', non-alphanumeric/dash → '_', trailing '_' trimmed.
+       Falls back to "disk" if the product string is empty. */
+    { char init_file[64];
+      { char name[32]; char *d = name; UWORD ci;
+        for (ci = 0; ci < 16 && rdb->disk_product[ci]; ci++) {
+            char c = rdb->disk_product[ci];
+            if (c == ' ') *d++ = '_';
+            else if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_')
+                *d++ = c;
+            else *d++ = '_';
+        }
+        /* Trim trailing underscores */
+        while (d > name && *(d-1) == '_') d--;
+        *d = '\0';
+        if (name[0]) sprintf(init_file, "RDB_extended_%s.backup", name);
+        else         sprintf(init_file, "RDB_extended_disk.backup");
+      }
+
     { struct FileRequester *fr; BOOL chosen = FALSE;
       { struct TagItem at[] = {
             { ASLFR_TitleText,    (ULONG)"Save Extended RDB Backup" },
             { ASLFR_DoSaveMode,   TRUE },
             { ASLFR_InitialDrawer,(ULONG)"RAM:" },
-            { ASLFR_InitialFile,  (ULONG)"RDB_extended.backup" },
+            { ASLFR_InitialFile,  (ULONG)init_file },
             { TAG_DONE, 0 } };
         fr = (struct FileRequester *)AllocAslRequest(ASL_FileRequest, at); }
       if (fr) {
@@ -2454,7 +2555,7 @@ static void rdb_backup_extended(struct Window *win, struct BlockDev *bd,
           FreeAslRequest(fr);
       }
       if (!chosen) { FreeVec(buf); return; }
-    }
+    }} /* end FileRequester + init_file blocks */
 
     { BPTR fh = Open((UBYTE *)save_path, MODE_NEWFILE);
       if (!fh) {
@@ -4910,7 +5011,7 @@ BOOL partview_run(const char *devname, ULONG unit)
     }
 
     GT_RefreshWindow(win, NULL);
-    draw_static(win, devname, unit, rdb,
+    draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                 ix, iy, iw, bx, by, bw, bh, hx, hy, hw, sel);
 
     /* ---- Event loop ---- */
@@ -5059,7 +5160,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                                              "Edit Partition", rdb)) {
                                             dirty = TRUE;
                                             refresh_listview(win, lv_gad, rdb, sel);
-                                            draw_static(win, devname, unit, rdb,
+                                            draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                         ix, iy, iw, bx, by, bw, bh,
                                                         hx, hy, hw, sel);
                                         }
@@ -5141,7 +5242,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 }
                             }
                             refresh_listview(win, lv_gad, rdb, sel);
-                            draw_static(win, devname, unit, rdb,
+                            draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
                                         hx, hy, hw, sel);
                         } else if (drag_new) {
@@ -5150,8 +5251,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             {
                                 struct PartInfo new_pi;
                                 memset(&new_pi, 0, sizeof(new_pi));
-                                sprintf(new_pi.drive_name, "DH%u",
-                                        (unsigned)rdb->num_parts);
+                                next_drive_name(rdb, new_pi.drive_name);
                                 new_pi.dos_type     = 0x444F5301UL;   /* FFS */
                                 new_pi.low_cyl      = drag_new_lo;
                                 new_pi.high_cyl     = drag_new_hi;
@@ -5175,7 +5275,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     refresh_listview(win, lv_gad, rdb, sel);
                                 }
                             }
-                            draw_static(win, devname, unit, rdb,
+                            draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
                                         hx, hy, hw, sel);
                         }
@@ -5245,7 +5345,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                                  "Edit Partition", rdb)) {
                                 dirty = TRUE;
                                 refresh_listview(win, lv_gad, rdb, sel);
-                                draw_static(win, devname, unit, rdb,
+                                draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
                                             hx, hy, hw, sel);
                             }
@@ -5330,7 +5430,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     sel   = -1;
                                     dirty = TRUE;
                                     refresh_listview(win, lv_gad, rdb, sel);
-                                    draw_static(win, devname, unit, rdb,
+                                    draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                 ix, iy, iw, bx, by, bw, bh,
                                                 hx, hy, hw, sel);
                                 } else if (choice == 2) {
@@ -5340,7 +5440,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     rdb->sectors   = real_secs;
                                     rdb->hi_cyl    = real_cyls - 1;
                                     dirty = TRUE;
-                                    draw_static(win, devname, unit, rdb,
+                                    draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                 ix, iy, iw, bx, by, bw, bh,
                                                 hx, hy, hw, sel);
                                 } else if (choice == 3) {
@@ -5374,7 +5474,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     sel   = -1;
                                     dirty = TRUE;
                                     refresh_listview(win, lv_gad, rdb, sel);
-                                    draw_static(win, devname, unit, rdb,
+                                    draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                 ix, iy, iw, bx, by, bw, bh,
                                                 hx, hy, hw, sel);
                                 } else if (choice == 2) {
@@ -5402,8 +5502,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                         if (lo > hi) break;
 
                         memset(&new_pi, 0, sizeof(new_pi));
-                        sprintf(new_pi.drive_name, "DH%u",
-                                (unsigned)rdb->num_parts);
+                        next_drive_name(rdb, new_pi.drive_name);
                         new_pi.dos_type     = 0x444F5301UL;   /* FFS */
                         new_pi.low_cyl      = lo;
                         new_pi.high_cyl     = hi;
@@ -5427,7 +5526,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             rdb->parts[rdb->num_parts++] = new_pi;
                             dirty = TRUE; needs_reboot = TRUE;
                             refresh_listview(win, lv_gad, rdb, sel);
-                            draw_static(win, devname, unit, rdb,
+                            draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
                                         hx, hy, hw, sel);
                         }
@@ -5440,7 +5539,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                                  "Edit Partition", rdb)) {
                                 dirty = TRUE;
                                 refresh_listview(win, lv_gad, rdb, sel);
-                                draw_static(win, devname, unit, rdb,
+                                draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
                                             hx, hy, hw, sel);
                             }
@@ -5469,7 +5568,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 if (sel >= (WORD)rdb->num_parts)
                                     sel = (WORD)rdb->num_parts - 1;
                                 refresh_listview(win, lv_gad, rdb, sel);
-                                draw_static(win, devname, unit, rdb,
+                                draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
                                             hx, hy, hw, sel);
                             }
@@ -5614,7 +5713,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             GT_SetGadgetAttrsA(lv_gad, win, NULL, st);
                         }
 
-                        draw_static(win, devname, unit, rdb,
+                        draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                     ix, iy, iw, bx, by, bw, bh,
                                     hx, hy, hw, sel);
                     }
@@ -5624,7 +5723,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                 case IDCMP_REFRESHWINDOW:
                     GT_BeginRefresh(win);
                     GT_EndRefresh(win, TRUE);
-                    draw_static(win, devname, unit, rdb,
+                    draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                 ix, iy, iw, bx, by, bw, bh,
                                 hx, hy, hw, sel);
                     break;
