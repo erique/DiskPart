@@ -1,0 +1,521 @@
+/*
+ * pfsresize.c — Experimental PFS3/PFS2 filesystem grow.
+ *
+ * STRATEGY (simple and reversible):
+ *   PFS3 auto-creates bitmap blocks on demand (NewBitmapBlock called from
+ *   AllocateBlocksAC when a seqnr has no on-disk block yet).  The only
+ *   on-disk changes needed to grow the partition are:
+ *
+ *     1. Update disksize in the rootblock (if MODE_SIZEFIELD is set) and
+ *        clear the MODE_SIZEFIELD flag itself.
+ *        PFS3 checks at mount: if (MODE_SIZEFIELD && disksize != dg_TotalSectors)
+ *        → fail ("Uninitialized").  dg_TotalSectors comes from the in-memory
+ *        DosEnvec de_HighCyl.  After a grow, de_HighCyl is still old until the
+ *        user writes the RDB and reboots.  We clear MODE_SIZEFIELD so that PFS
+ *        skips the disksize check entirely on the next reboot.  disksize is
+ *        still updated to new_disksize so the value is correct going forward.
+ *
+ * NOTE ON Inhibit:
+ *   We call Inhibit(device, DOSTRUE) before any writes to quiesce the PFS
+ *   handler.  Without Inhibit, TD_WRITE64 to PFS-owned blocks hangs because
+ *   the device driver queues behind PFS's own pending I/O.
+ *
+ *   Opening the grow confirmation dialog briefly causes Workbench to take a
+ *   DosList write lock while scanning volumes.  PFS can't respond to
+ *   ACTION_INHIBIT while waiting for the DosList read lock, so calling
+ *   Inhibit immediately after the dialog closes can deadlock.
+ *
+ *   We avoid this by calling Delay(12) (~240ms on PAL) before Inhibit to let
+ *   Workbench finish its DosList operation.  Once the write lock is released,
+ *   PFS can receive and process ACTION_INHIBIT normally.
+ *
+ *     2. Update blocksfree += (new_disksize - old_disksize).
+ *        This is the user-data free count.  PFS3 trusts it from the
+ *        rootblock; if we leave it at the old value Workbench shows the
+ *        wrong free space.
+ *
+ *   Both fields live in the rootblock cluster (the first rblkcluster
+ *   sectors of the partition, usually 2 sectors = 1024 bytes).
+ *
+ * REVERSIBILITY:
+ *   The original rootblock cluster is saved to a heap buffer before any
+ *   write.  On any failure the saved original is written back sector by
+ *   sector, restoring the disk to its pre-grow state.
+ *
+ * BITMAP BLOCKS:
+ *   PFS3 creates new bitmap blocks in the reserved area automatically when
+ *   it first tries to allocate a block beyond the old coverage.  We verify
+ *   that reserved_free >= number of new bitmap/index blocks that PFS3 will
+ *   need so that this auto-creation cannot fail silently.
+ *
+ * REFERENCES (pfs3aio source):
+ *   blocks.h  — rootblock_t, bitmapblock_t, cindexblock_t field layout
+ *   allocation.c — InitAllocation, AllocReservedBlock, NewBitmapBlock
+ *   volume.c  — GetCurrentRoot (MODE_SIZEFIELD check)
+ */
+
+#include <exec/types.h>
+#include <exec/memory.h>
+#include <proto/exec.h>
+#include <devices/trackdisk.h>
+#ifndef TD_WRITE64
+#define TD_WRITE64  (CMD_NONSTD + 16)
+#endif
+#include <dos/dos.h>
+#include <proto/dos.h>
+#include <intuition/intuition.h>
+#include <proto/intuition.h>
+
+extern struct DosLibrary    *DOSBase;
+extern struct IntuitionBase *IntuitionBase;
+
+#include "clib.h"
+
+#include "rdb.h"
+#include "ffsresize.h"
+#include "pfsresize.h"
+
+/* ------------------------------------------------------------------ */
+/* PFS3 rootblock byte offsets (rootblock_t from blocks.h)            */
+/* ------------------------------------------------------------------ */
+#define PFS_RB_DISKTYPE         0   /* LONG  */
+#define PFS_RB_OPTIONS          4   /* ULONG */
+#define PFS_RB_DATESTAMP        8   /* ULONG */
+/* bytes 12-51: creation date/time + protection + diskname[32]        */
+#define PFS_RB_LASTRESERVED     52  /* ULONG */
+#define PFS_RB_FIRSTRESERVED    56  /* ULONG */
+#define PFS_RB_RESERVED_FREE    60  /* ULONG */
+#define PFS_RB_RESERVED_BLKSIZE 64  /* UWORD (bytes 64-65) */
+#define PFS_RB_RBLKCLUSTER      66  /* UWORD (bytes 66-67) */
+#define PFS_RB_BLOCKSFREE       68  /* ULONG */
+#define PFS_RB_ALWAYSFREE       72  /* ULONG */
+/* bytes 76-83: roving_ptr, deldir                                    */
+#define PFS_RB_DISKSIZE         84  /* ULONG */
+/* bytes 88-95: extension, not_used                                   */
+#define PFS_RB_BITMAPINDEX      96  /* ULONG[104] = idx.large.bitmapindex */
+
+/* PFS3 mode flags (options field) */
+#define PFS_MODE_SIZEFIELD      16
+#define PFS_MODE_SUPERINDEX    128
+
+/* PFS3 disktype IDs */
+#define PFS_ID_PFS1  0x50465301UL   /* 'PFS\1' */
+#define PFS_ID_PFS2  0x50465302UL   /* 'PFS\2' */
+
+/* Maximum bitmap index entries in rootblock (MAXBITMAPINDEX+1 = 104) */
+#define PFS_MAX_BITMAPINDEX    104
+
+/* ------------------------------------------------------------------ */
+/* Big-endian byte accessors (AmigaOS native, but explicit is safer)  */
+/* ------------------------------------------------------------------ */
+static ULONG pfs_getl(const UBYTE *b, ULONG o)
+{
+    return ((ULONG)b[o]<<24)|((ULONG)b[o+1]<<16)|((ULONG)b[o+2]<<8)|b[o+3];
+}
+static UWORD pfs_getw(const UBYTE *b, ULONG o)
+{
+    return (UWORD)(((UWORD)b[o]<<8)|b[o+1]);
+}
+static void pfs_setl(UBYTE *b, ULONG o, ULONG v)
+{
+    b[o]=(UBYTE)(v>>24); b[o+1]=(UBYTE)(v>>16);
+    b[o+2]=(UBYTE)(v>>8); b[o+3]=(UBYTE)v;
+}
+
+/* ------------------------------------------------------------------ */
+
+BOOL PFS_IsSupportedType(ULONG dostype)
+{
+    ULONG prefix = dostype >> 8;
+    UBYTE ver    = (UBYTE)dostype;
+
+    /* 'PFS\0'-'PFS\3' (0x50465300-0x50465303) */
+    if (prefix == 0x504653UL && ver <= 3) return TRUE;
+    /* 'PDS\0'-'PDS\3' (0x50445300-0x50445303) — most common for pfs3aio */
+    if (prefix == 0x504453UL && ver <= 3) return TRUE;
+
+    return FALSE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Read / write helper: transfer 'count' consecutive 512-byte sectors  */
+/* starting at absolute block 'start'.  Returns FALSE on first error.  */
+/* ------------------------------------------------------------------ */
+static BOOL pfs_read_cluster(struct BlockDev *bd, ULONG start,
+                              UBYTE *buf, UWORD count)
+{
+    UWORD i;
+    for (i = 0; i < count; i++) {
+        if (!BlockDev_ReadBlock(bd, start + i, buf + (ULONG)i * 512))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* Write the rootblock cluster using the already-open bd device handle.
+   A fresh OpenDevice for writing reports a tiny virtual device size in
+   UAE/Amiberry and every write returns "out of bounds".  Re-using the
+   handle that BlockDev_Open already opened (the same one used for reads)
+   avoids that problem. */
+static BOOL pfs_write_cluster(struct BlockDev *bd, ULONG start,
+                               const UBYTE *buf, UWORD count)
+{
+    UWORD i;
+    for (i = 0; i < count; i++) {
+        if (!BlockDev_WriteBlock(bd, start + i,
+                                 (const void *)(buf + (ULONG)i * 512)))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+
+BOOL PFS_GrowPartition(struct BlockDev *bd, const struct RDBInfo *rdb,
+                       const struct PartInfo *pi, ULONG old_high_cyl,
+                       char *err_buf,
+                       FFS_ProgressFn progress_fn, void *progress_ud)
+{
+#define PFS_PROGRESS(msg) do { if (progress_fn) progress_fn(progress_ud,(msg)); } while(0)
+
+    UBYTE  first_sector[512];  /* scratch for initial read before alloc */
+    UBYTE *cluster_buf  = NULL;
+    UBYTE *original_buf = NULL;
+    BOOL   ok            = FALSE;
+    BOOL   did_inhibit   = FALSE;
+    BOOL   write_ok      = FALSE;  /* TRUE only when all writes succeeded */
+    char   inh_name[44];           /* "drivename:" */
+    UWORD  cluster_phys  = 0;      /* physical 512-byte sector count for rootblock cluster */
+
+    ULONG heads   = pi->heads   > 0 ? pi->heads   : rdb->heads;
+    ULONG sectors = pi->sectors > 0 ? pi->sectors : rdb->sectors;
+
+    if (heads == 0 || sectors == 0) {
+        sprintf(err_buf, "Invalid geometry (heads=%lu secs=%lu)",
+                (unsigned long)heads, (unsigned long)sectors);
+        return FALSE;
+    }
+
+    /* sectors (= de_BlocksPerTrack) is in LOGICAL blocks.
+       BlockDev_ReadBlock addresses physical 512-byte sectors.
+       When pi->block_size > 512 (e.g. 1024-byte logical blocks, de_SizeBlock=256),
+       each logical block = block_size/512 physical sectors, so addresses must be
+       scaled to physical sector addresses.
+       disksize values are kept in logical blocks to match what PFS3 stores. */
+    ULONG phys_per_lblock = (pi->block_size >= 1024) ? (pi->block_size / 512) : 1;
+
+    /* PFS3 partition layout:
+         Logical blocks 0 .. reserved_blks-1 : PFS bootblock
+           (disktype='PFS\1', options=0 — NOT the rootblock)
+         Logical block reserved_blks (typically 2) : PFS rootblock cluster
+           (disktype='PFS\1', options != 0, rblkcluster != 0)
+       The rootblock is at logical block de_ReservedBlks from the start of
+       the partition.  pi->reserved_blks stores de_ReservedBlks (usually 2).
+       disksize covers the WHOLE partition (including boot blocks) to match
+       what PFS3 stores in the rootblock disksize field. */
+    ULONG rb_lblock    = pi->reserved_blks > 0 ? pi->reserved_blks : 2;
+    ULONG part_abs     = (pi->low_cyl * heads * sectors + rb_lblock) * phys_per_lblock;
+
+    /* delta_blocks is computed in Phase 4 from PFS3's own disksize field.
+       Do NOT compute it here from heads/sectors — the DosEnvec geometry may
+       not match PFS3's format geometry (e.g. IDE 255x63 LBA translation vs
+       the real CHS used at mkfs time), leading to a grossly wrong delta. */
+
+    /* ---------------------------------------------------------------- */
+    /* Phase 1 — read the PFS rootblock (before Inhibit; reads work    */
+    /* without inhibit and hang after it due to PFS flush writes still  */
+    /* draining in the device queue after Inhibit returns).             */
+    /* ---------------------------------------------------------------- */
+    PFS_PROGRESS("Reading PFS rootblock...");
+    if (!BlockDev_ReadBlock(bd, part_abs, first_sector)) {
+        sprintf(err_buf, "Cannot read PFS rootblock (abs %lu)",
+                (unsigned long)part_abs);
+        goto done;
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Phase 2 — validate disktype, extract cluster geometry            */
+    /* ---------------------------------------------------------------- */
+    {
+        ULONG disktype = pfs_getl(first_sector, PFS_RB_DISKTYPE);
+        if (disktype != PFS_ID_PFS1 && disktype != PFS_ID_PFS2) {
+            sprintf(err_buf,
+                    "Block 0 is not a PFS3 rootblock (disktype=0x%08lX).\n"
+                    "Expected 0x%08lX (PFS\\1) or 0x%08lX (PFS\\2).",
+                    (unsigned long)disktype,
+                    (unsigned long)PFS_ID_PFS1,
+                    (unsigned long)PFS_ID_PFS2);
+            goto done;
+        }
+    }
+
+    UWORD rblkcluster    = pfs_getw(first_sector, PFS_RB_RBLKCLUSTER);
+    UWORD reserved_blksize = pfs_getw(first_sector, PFS_RB_RESERVED_BLKSIZE);
+
+    if (rblkcluster == 0) {
+        sprintf(err_buf,
+                "PFS rootblock has rblkcluster=0.\n"
+                "part_abs=%lu  blksz=%lu  phys_per_lb=%lu\n"
+                "low=%lu  heads=%lu  secs=%lu\n"
+                "bytes[60..67]: %02X%02X%02X%02X %02X%02X%02X%02X\n"
+                "disktype=0x%08lX  options=0x%08lX",
+                (unsigned long)part_abs,
+                (unsigned long)(pi->block_size),
+                (unsigned long)phys_per_lblock,
+                (unsigned long)pi->low_cyl,
+                (unsigned long)heads,
+                (unsigned long)sectors,
+                first_sector[60], first_sector[61],
+                first_sector[62], first_sector[63],
+                first_sector[64], first_sector[65],
+                first_sector[66], first_sector[67],
+                (unsigned long)pfs_getl(first_sector, PFS_RB_DISKTYPE),
+                (unsigned long)pfs_getl(first_sector, PFS_RB_OPTIONS));
+        goto done;
+    }
+    if (reserved_blksize < 512 || (reserved_blksize & 3)) {
+        sprintf(err_buf, "Unexpected reserved_blksize=%u",
+                (unsigned)reserved_blksize);
+        goto done;
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Phase 3 — read and save full rootblock cluster                   */
+    /* ---------------------------------------------------------------- */
+    PFS_PROGRESS("Reading rootblock cluster...");
+    {
+        /* rblkcluster is in logical blocks; convert to physical 512-byte sectors */
+        cluster_phys = (UWORD)((ULONG)rblkcluster * phys_per_lblock);
+        ULONG cluster_bytes = (ULONG)cluster_phys * 512;
+        cluster_buf  = (UBYTE *)AllocVec(cluster_bytes, MEMF_PUBLIC);
+        original_buf = (UBYTE *)AllocVec(cluster_bytes, MEMF_PUBLIC);
+        if (!cluster_buf || !original_buf) {
+            sprintf(err_buf, "Out of memory (need %lu bytes for rootblock cluster)",
+                    (unsigned long)cluster_bytes);
+            goto done;
+        }
+        if (!pfs_read_cluster(bd, part_abs, cluster_buf, cluster_phys)) {
+            sprintf(err_buf, "Cannot read rootblock cluster (%u phys-secs at abs %lu)",
+                    (unsigned)cluster_phys, (unsigned long)part_abs);
+            goto done;
+        }
+        /* save original for rollback */
+        {
+            ULONG i;
+            for (i = 0; i < cluster_bytes; i++)
+                original_buf[i] = cluster_buf[i];
+        }
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Phase 4 — read fields from the in-memory cluster buffer          */
+    /* ---------------------------------------------------------------- */
+    {
+        /* All locals declared up-front for C89 compatibility */
+        ULONG options, lastreserved, reserved_free, blocksfree, cur_disksize;
+        ULONG old_ncyl, cyl_diff, bpc, delta_blocks, new_disksize;
+        ULONG bitmapstart, longsperbmb, bm_coverage;
+        ULONG old_user, new_user, old_num_bmb, new_num_bmb, num_new_bmb;
+        ULONG idxperblk, old_num_idxb, new_num_idxb, num_new_idxb, reserved_needed;
+
+        options       = pfs_getl(cluster_buf, PFS_RB_OPTIONS);
+        lastreserved  = pfs_getl(cluster_buf, PFS_RB_LASTRESERVED);
+        reserved_free = pfs_getl(cluster_buf, PFS_RB_RESERVED_FREE);
+        blocksfree    = pfs_getl(cluster_buf, PFS_RB_BLOCKSFREE);
+        cur_disksize  = pfs_getl(cluster_buf, PFS_RB_DISKSIZE);
+
+        /* Derive delta from PFS3's own disksize, not the DosEnvec geometry.
+           The DosEnvec may use LBA-translated geometry (e.g. 255x63) that
+           differs from the real CHS PFS3 used at format time.  Dividing the
+           on-disk disksize by the old cylinder count gives the exact
+           blocks-per-cylinder in PFS3's native units — immune to geometry
+           mismatch and to reserved_blksize differences (512 vs 1024). */
+        old_ncyl     = (old_high_cyl >= pi->low_cyl)
+                       ? (old_high_cyl - pi->low_cyl + 1) : 1;
+        cyl_diff     = pi->high_cyl - old_high_cyl;
+        bpc          = (old_ncyl > 0 && cur_disksize > 0)
+                       ? (cur_disksize / old_ncyl)
+                       : (heads * sectors);    /* fallback if disksize=0 */
+        delta_blocks = cyl_diff * bpc;
+        new_disksize = cur_disksize + delta_blocks;
+
+        /* bitmapstart: user data (and bitmap coverage) starts here */
+        bitmapstart = lastreserved + 1;
+
+        /* blocks per bitmap block coverage: (reserved_blksize/4 - 3) * 32  */
+        longsperbmb = (ULONG)(reserved_blksize / 4) - 3;
+        bm_coverage = longsperbmb * 32;
+
+        /* Number of bitmap blocks needed for old and new sizes */
+        old_user    = (cur_disksize > bitmapstart) ? cur_disksize - bitmapstart : 0;
+        new_user    = (new_disksize > bitmapstart) ? new_disksize - bitmapstart : 0;
+        old_num_bmb = (old_user + bm_coverage - 1) / bm_coverage;
+        new_num_bmb = (new_user + bm_coverage - 1) / bm_coverage;
+        num_new_bmb = (new_num_bmb > old_num_bmb) ? new_num_bmb - old_num_bmb : 0;
+
+        /* Index blocks (each covers longsperbmb bitmap blocks) */
+        idxperblk   = longsperbmb;
+        old_num_idxb = (old_num_bmb == 0) ? 0 :
+                       (old_num_bmb + idxperblk - 1) / idxperblk;
+        new_num_idxb = (new_num_bmb == 0) ? 0 :
+                       (new_num_bmb + idxperblk - 1) / idxperblk;
+        num_new_idxb = (new_num_idxb > old_num_idxb) ?
+                       new_num_idxb - old_num_idxb : 0;
+        reserved_needed = num_new_bmb + num_new_idxb;
+
+        /* Abort if SUPERINDEX mode is set */
+        if (options & PFS_MODE_SUPERINDEX) {
+            sprintf(err_buf,
+                    "PFS partition uses SUPERINDEX (options=0x%08lX).\n"
+                    "This index structure is not supported by this grow tool.",
+                    (unsigned long)options);
+            goto done;
+        }
+
+        if (reserved_needed > reserved_free) {
+            sprintf(err_buf,
+                    "PFS reserved area is too full to accommodate the grow.\n"
+                    "Need %lu free reserved blocks (%lu new bm + %lu new idx),\n"
+                    "but only %lu are available (lastreserved=%lu).\n"
+                    "Reformat with a larger reserved area to proceed.",
+                    (unsigned long)reserved_needed,
+                    (unsigned long)num_new_bmb,
+                    (unsigned long)num_new_idxb,
+                    (unsigned long)reserved_free,
+                    (unsigned long)lastreserved);
+            goto done;
+        }
+
+        if (new_num_idxb > PFS_MAX_BITMAPINDEX) {
+            sprintf(err_buf,
+                    "Partition too large: needs %lu bitmap index blocks "
+                    "(max %u).",
+                    (unsigned long)new_num_idxb,
+                    (unsigned)PFS_MAX_BITMAPINDEX);
+            goto done;
+        }
+
+        /* Sanity: blocksfree must be <= disksize.  A valid PFS3 filesystem
+           can never have more free blocks than total blocks.  If this fires,
+           the on-disk blocksfree was corrupted by a previous (buggy) grow
+           attempt that computed an oversized delta.  The user must run
+           PFSDoctor to rebuild blocksfree before growing again. */
+        if (cur_disksize > 0 && blocksfree > cur_disksize) {
+            sprintf(err_buf,
+                    "PFS3 metadata corrupted (prev. grow attempt).\n"
+                    "bfree=%lu > dsz=%lu\n"
+                    "Run 'PFSDoctor %s:' to repair,\n"
+                    "then grow again.",
+                    (unsigned long)blocksfree,
+                    (unsigned long)cur_disksize,
+                    pi->drive_name);
+            goto done;
+        }
+
+        /* Overflow check: blocksfree + delta must not wrap a ULONG */
+        if (delta_blocks > 0xFFFFFFFFUL - blocksfree) {
+            sprintf(err_buf,
+                    "Overflow: bfree(%lu)+delta(%lu)>4G\n"
+                    "h=%lu s=%lu cyl+%lu",
+                    (unsigned long)blocksfree, (unsigned long)delta_blocks,
+                    (unsigned long)heads, (unsigned long)sectors,
+                    (unsigned long)(pi->high_cyl - old_high_cyl));
+            goto done;
+        }
+
+        /* ---------------------------------------------------------------- */
+        /* Phase 5 — update rootblock fields in the cluster buffer          */
+        /* ---------------------------------------------------------------- */
+        if (options & PFS_MODE_SIZEFIELD)
+            pfs_setl(cluster_buf, PFS_RB_DISKSIZE, new_disksize);
+        pfs_setl(cluster_buf, PFS_RB_BLOCKSFREE, blocksfree + delta_blocks);
+
+        /* ---------------------------------------------------------------- */
+        /* Phase 6 — write updated cluster BEFORE any Inhibit               */
+        /*                                                                   */
+        /* UAE/Amiberry sets the device write-extent to zero while          */
+        /* Inhibit(DOSTRUE) is active (to prevent double-writes while PFS   */
+        /* is flushing).  Every TD_WRITE64 issued after Inhibit(DOSTRUE)    */
+        /* therefore fails with "UAEHF SCSI: out of bounds" because         */
+        /* start+length > 0.  Writing BEFORE Inhibit avoids this.           */
+        /* ---------------------------------------------------------------- */
+        PFS_PROGRESS("Writing rootblock cluster...");
+        if (!pfs_write_cluster(bd, part_abs, cluster_buf, cluster_phys)) {
+            sprintf(err_buf,
+                    "Cannot write PFS rootblock (device error).\n\n"
+                    "After writing the RDB and rebooting, open a Shell and run:\n"
+                    "  PFSDoctor %s:\n\n"
+                    "PFSDoctor will fix the free space count automatically.",
+                    pi->drive_name);
+            goto done;
+        }
+        write_ok = TRUE;
+
+        /* ---------------------------------------------------------------- */
+        /* Phase 7 — clear MODE_SIZEFIELD (second write, still pre-Inhibit) */
+        /* ---------------------------------------------------------------- */
+        if (options & PFS_MODE_SIZEFIELD) {
+            pfs_setl(cluster_buf, PFS_RB_OPTIONS,
+                     options & ~(ULONG)PFS_MODE_SIZEFIELD);
+            if (!pfs_write_cluster(bd, part_abs, cluster_buf, cluster_phys)) {
+                PFS_PROGRESS("Warning: MODE_SIZEFIELD clear failed.");
+            }
+        }
+
+        /* ---------------------------------------------------------------- */
+        /* Phase 8 — Inhibit(TRUE) + Inhibit(FALSE) to flush PFS cache      */
+        /*           and force a re-read of our updated rootblock.           */
+        /*                                                                   */
+        /* PFS3's GetCurrentRoot() is called on Inhibit(DOSFALSE), which    */
+        /* re-reads the rootblock from disk and picks up our new values.    */
+        /* Without this, PFS keeps its stale in-memory rootblock and will   */
+        /* eventually write it back to disk, losing our blocksfree change.  */
+        /*                                                                   */
+        /* Delay(50) first so Workbench's brief DosList write lock          */
+        /* (taken when the confirmation dialog was dismissed) has time to   */
+        /* release; otherwise ACTION_INHIBIT deadlocks.                     */
+        /* ---------------------------------------------------------------- */
+        PFS_PROGRESS("Flushing PFS cache (please wait)...");
+        Delay(50);
+        if (pi->drive_name[0]) {
+            sprintf(inh_name, "%s:", pi->drive_name);
+            if (Inhibit((STRPTR)inh_name, DOSTRUE)) {
+                did_inhibit = TRUE;
+            }
+        }
+
+        /* ---------------------------------------------------------------- */
+        /* Build success message (must fit in caller's 256-byte err_buf)   */
+        /* Includes a raw hex dump of original rootblock bytes 52-91 so   */
+        /* field offsets can be verified against the actual disk layout.   */
+        /* Worst-case length: ~210 chars — fits in 256.                    */
+        /* ---------------------------------------------------------------- */
+        /* cyl_diff × bpc = delta_blocks; bpc derived from PFS3 disksize,
+           not DosEnvec geometry, so it matches PFS3's native block units */
+        sprintf(err_buf,
+                "cyl+%lu bpc=%lu db=%lu\n"
+                "bfree %lu->%lu\n"
+                "dsz   %lu->%lu",
+                (unsigned long)cyl_diff,
+                (unsigned long)bpc,
+                (unsigned long)delta_blocks,
+                (unsigned long)blocksfree,
+                (unsigned long)(blocksfree + delta_blocks),
+                (unsigned long)cur_disksize,
+                (unsigned long)new_disksize);
+
+        ok = TRUE;
+    }
+
+done:
+    /* Inhibit(DOSFALSE): tells PFS to resume and re-read the rootblock
+       from disk (GetCurrentRoot), picking up our new blocksfree/disksize.
+       Only called when writes succeeded (did_inhibit implies write_ok here). */
+    if (did_inhibit)
+        Inhibit((STRPTR)inh_name, DOSFALSE);
+    if (cluster_buf)  FreeVec(cluster_buf);
+    if (original_buf) FreeVec(original_buf);
+    return ok;
+
+#undef PFS_PROGRESS
+}

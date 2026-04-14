@@ -266,11 +266,14 @@ BOOL BlockDev_WriteBlock(struct BlockDev *bd, ULONG blocknum, const void *buf)
     BYTE err;
     UQUAD byte_off = (UQUAD)blocknum * bd->block_size;
 
-    /* TD_WRITE64 + CMD_UPDATE.  CMD_WRITE hangs on cached FFS partition blocks
-       in UAE/Amiberry (it blocks rather than returning an error).  TD_WRITE64
-       bypasses the driver's sector cache and works reliably for all blocks
-       in the RDB/data area.  HD_SCSICMD WRITE causes a 4-byte DMA shift on
-       A3000 SD adapters and must not be used as a write path. */
+    /* TD_WRITE64.  CMD_WRITE and CMD_UPDATE both hang on cached filesystem
+       partition blocks in UAE/Amiberry — they block waiting for the
+       filesystem handler to flush its cache, which can deadlock if the
+       handler is blocked.  TD_WRITE64 bypasses the driver's sector cache
+       and writes directly without involving any filesystem handler.
+       HD_SCSICMD WRITE must not be used (4-byte DMA shift on A3000 SD
+       adapters).  CMD_UPDATE removed: TD_WRITE64 already commits the data
+       directly, so CMD_UPDATE is redundant and hangs on active partitions. */
     bd->iotd.iotd_Req.io_Command = TD_WRITE64;
     bd->iotd.iotd_Req.io_Length  = bd->block_size;
     bd->iotd.iotd_Req.io_Data    = (APTR)buf;
@@ -283,13 +286,6 @@ BOOL BlockDev_WriteBlock(struct BlockDev *bd, ULONG blocknum, const void *buf)
         bd->last_io_err = err;
         return FALSE;
     }
-
-    bd->iotd.iotd_Req.io_Command = CMD_UPDATE;
-    bd->iotd.iotd_Req.io_Length  = 0;
-    bd->iotd.iotd_Req.io_Data    = NULL;
-    bd->iotd.iotd_Req.io_Flags   = 0;
-    bd->iotd.iotd_Count          = 0;
-    DoIO((struct IORequest *)&bd->iotd);
 
     return TRUE;
 }
