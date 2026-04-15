@@ -46,6 +46,7 @@
 #include "ffsresize.h"
 #include "pfsresize.h"
 #include "sfsresize.h"
+#include "partmove.h"
 
 /* ------------------------------------------------------------------ */
 /* External library bases (defined in main.c)                          */
@@ -83,6 +84,7 @@ extern struct Library       *GadToolsBase;
 #define GID_FILESYS   6
 #define GID_WRITE     7
 #define GID_BACK      8
+#define GID_MOVE      11
 #define GID_LASTDISK  9
 #define GID_LASTLUN   10
 
@@ -2354,7 +2356,7 @@ static BOOL build_gadgets(APTR vi,
     UWORD btn_y   = win_h - bor_b - pad - btn_h;
     UWORD lv_top;
     UWORD lv_h;
-    UWORD seventh;
+    UWORD eighth_unused_; /* replaced by eighth inside button block */
 
     lay->ix = (WORD)(bor_l + pad);
     lay->iy = (WORD)(bor_t + pad);
@@ -2453,24 +2455,27 @@ static BOOL build_gadgets(APTR vi,
     prev = lv;
 
     /* Button row */
-    seventh = (inner_w - pad * 2 - pad * 6) / 7;
+    {
+    UWORD eighth = (inner_w - pad * 2 - pad * 7) / 8;
     ng.ng_TopEdge = (WORD)btn_y;
     ng.ng_Height  = btn_h;
-    ng.ng_Width   = seventh;
+    ng.ng_Width   = eighth;
 
 #define MKBTN(lx,txt,gid) \
     ng.ng_LeftEdge=(lx); ng.ng_GadgetText=(txt); ng.ng_GadgetID=(gid); \
     prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt); \
     if (!prev) { FreeGadgets(glist); return FALSE; }
 
-    MKBTN(bor_l+pad,                      "Init RDB", GID_INITRDB)
-    MKBTN(bor_l+pad+(seventh+pad)*1,      "Add",      GID_ADD)
-    MKBTN(bor_l+pad+(seventh+pad)*2,      "Edit",     GID_EDIT)
-    MKBTN(bor_l+pad+(seventh+pad)*3,      "Delete",   GID_DELETE)
-    MKBTN(bor_l+pad+(seventh+pad)*4,      "FileSys",  GID_FILESYS)
-    MKBTN(bor_l+pad+(seventh+pad)*5,      "Write",    GID_WRITE)
-    MKBTN(bor_l+pad+(seventh+pad)*6,      "Back",     GID_BACK)
+    MKBTN(bor_l+pad,                     "Init RDB", GID_INITRDB)
+    MKBTN(bor_l+pad+(eighth+pad)*1,      "Add",      GID_ADD)
+    MKBTN(bor_l+pad+(eighth+pad)*2,      "Edit",     GID_EDIT)
+    MKBTN(bor_l+pad+(eighth+pad)*3,      "Delete",   GID_DELETE)
+    MKBTN(bor_l+pad+(eighth+pad)*4,      "Move",     GID_MOVE)
+    MKBTN(bor_l+pad+(eighth+pad)*5,      "FileSys",  GID_FILESYS)
+    MKBTN(bor_l+pad+(eighth+pad)*6,      "Write",    GID_WRITE)
+    MKBTN(bor_l+pad+(eighth+pad)*7,      "Back",     GID_BACK)
 #undef MKBTN
+    }
 
     /* Last Disk / Last LUN checkboxes — right-aligned on info line 3 */
     {
@@ -5227,6 +5232,470 @@ static void check_ffs_root(struct Window *win, struct BlockDev *bd,
     FreeVec(buf);
 }
 
+/* ================================================================== */
+/* Partition Move                                                       */
+/* ================================================================== */
+
+/* Gadget IDs for the move confirmation dialog */
+#define MVDLG_NEWCYL  201
+#define MVDLG_BACKUP  202
+#define MVDLG_MOVE    203
+#define MVDLG_CANCEL  204
+
+/* ------------------------------------------------------------------ */
+/* Progress callback for PART_Move.                                    */
+/* Draws a filled bar with %, then the phase text below it.            */
+/* ------------------------------------------------------------------ */
+struct MoveProgUD {
+    struct Window *win;
+};
+
+static void move_progress_fn(void *ud, ULONG done, ULONG total, const char *phase)
+{
+    struct MoveProgUD *pu = (struct MoveProgUD *)ud;
+    struct Window   *pw;
+    struct RastPort *rp;
+    WORD x1, y1, x2;
+    WORD bar_x, bar_y, bar_w, bar_h, filled_w;
+    char  pct_str[8];
+    ULONG pct;
+    UWORD plen, phlen, i;
+
+    if (!pu || !pu->win) return;
+    pw = pu->win;
+
+    rp = pw->RPort;
+    x1 = pw->BorderLeft;
+    y1 = pw->BorderTop;
+    x2 = (WORD)(pw->Width  - 1 - pw->BorderRight);
+
+    /* Clear interior */
+    SetAPen(rp, 0);
+    RectFill(rp, x1, y1, x2, (WORD)(pw->Height - 1 - pw->BorderBottom));
+
+    bar_x = (WORD)(x1 + 4);
+    bar_y = (WORD)(y1 + 4);
+    bar_w = (WORD)(x2 - x1 - 8);
+    bar_h = 6;
+
+    if (bar_w > 0) {
+        pct      = (total > 0) ? (done * 100UL / total) : 0;
+        filled_w = (total > 0) ? (WORD)((ULONG)bar_w * done / total) : 0;
+
+        /* Empty track */
+        SetAPen(rp, 2);
+        RectFill(rp, bar_x, bar_y,
+                 (WORD)(bar_x + bar_w), (WORD)(bar_y + bar_h));
+        /* Filled portion */
+        if (filled_w > 0) {
+            SetAPen(rp, 3);
+            RectFill(rp, bar_x, bar_y,
+                     (WORD)(bar_x + filled_w), (WORD)(bar_y + bar_h));
+        }
+        /* Border */
+        SetAPen(rp, 1);
+        Move(rp, bar_x, bar_y);
+        Draw(rp, (WORD)(bar_x + bar_w), bar_y);
+        Draw(rp, (WORD)(bar_x + bar_w), (WORD)(bar_y + bar_h));
+        Draw(rp, bar_x, (WORD)(bar_y + bar_h));
+        Draw(rp, bar_x, bar_y);
+
+        /* Percentage string */
+        pct_str[0] = (UBYTE)('0' + pct / 100);
+        pct_str[1] = (UBYTE)('0' + (pct / 10) % 10);
+        pct_str[2] = (UBYTE)('0' + pct % 10);
+        pct_str[3] = '%';
+        pct_str[4] = '\0';
+        /* Trim leading zeros but keep at least "0%" */
+        plen = 4;
+        if (pct_str[0] == '0') {
+            pct_str[0] = pct_str[1];
+            pct_str[1] = pct_str[2];
+            pct_str[2] = pct_str[3];
+            pct_str[3] = '\0'; plen = 3;
+            if (pct_str[0] == '0') {
+                pct_str[0] = pct_str[1];
+                pct_str[1] = pct_str[2];
+                pct_str[2] = '\0'; plen = 2;
+            }
+        }
+        /* Draw % centered in bar (pen 1 over unfilled, pen 0 over filled) */
+        {
+            WORD tx = (WORD)(bar_x + (bar_w - (WORD)(plen * rp->TxWidth)) / 2);
+            WORD ty = (WORD)(bar_y + 1 + rp->TxBaseline);
+            if (ty < (WORD)(bar_y + bar_h)) {
+                SetAPen(rp, 1);
+                Move(rp, tx, ty);
+                Text(rp, (STRPTR)pct_str, (WORD)plen);
+            }
+        }
+    }
+
+    /* Phase text */
+    SetAPen(rp, 1);
+    phlen = 0; while (phase[phlen]) phlen++;
+    Move(rp, (WORD)(x1 + 6),
+         (WORD)(bar_y + bar_h + 4 + rp->TxBaseline));
+    Text(rp, (STRPTR)phase, (WORD)phlen);
+
+    (void)i; /* suppress unused warning */
+}
+
+/* ------------------------------------------------------------------ */
+/* Draw static warning text in the move confirm dialog.               */
+/* Called on open and on every IDCMP_REFRESHWINDOW.                    */
+/* ------------------------------------------------------------------ */
+static void draw_move_warn_text(struct Window *pw,
+                                 const char *pname,
+                                 ULONG lo, ULONG hi)
+{
+    struct RastPort *rp = pw->RPort;
+    WORD x  = (WORD)(pw->BorderLeft + 4);
+    WORD lh = (WORD)(rp->TxHeight + 2);
+    WORD y  = (WORD)(pw->BorderTop + 4);
+    static char line[72];
+    UWORD len;
+
+#define WTEXT(s) \
+    len = 0; while ((s)[len]) len++; \
+    Move(rp, x, (WORD)(y + rp->TxBaseline)); \
+    Text(rp, (STRPTR)(s), (WORD)len); \
+    y = (WORD)(y + lh);
+
+    SetAPen(rp, 1);
+
+    WTEXT("WARNING:  MOVING A PARTITION COPIES ALL DATA ON DISK.")
+    y = (WORD)(y + lh / 2);
+
+    sprintf(line, "Partition %s (cyl %lu-%lu) will be physically",
+            pname, (unsigned long)lo, (unsigned long)hi);
+    WTEXT(line)
+    WTEXT("copied to the cylinder you enter above.")
+
+    y = (WORD)(y + lh / 2);
+
+    WTEXT("POWER LOSS OR CRASH DURING THIS PROCESS WILL")
+    WTEXT("PERMANENTLY DESTROY YOUR DATA.  No rollback.")
+
+#undef WTEXT
+}
+
+/* ------------------------------------------------------------------ */
+/* offer_move_partition                                                 */
+/* ------------------------------------------------------------------ */
+static BOOL offer_move_partition(struct Window *win,
+                                  struct BlockDev *bd,
+                                  struct RDBInfo *rdb,
+                                  struct PartInfo *pi,
+                                  ULONG default_lo)   /* 0 = use pi->low_cyl */
+{
+    struct Screen  *scr     = NULL;
+    APTR            vi      = NULL;
+    struct Gadget  *glist   = NULL;
+    struct Gadget  *gctx    = NULL;
+    struct Gadget  *cyl_gad = NULL;
+    struct Gadget  *chk_gad = NULL;
+    struct Gadget  *btn_move = NULL;
+    struct Window  *dlg     = NULL;
+    BOOL   result    = FALSE;
+    BOOL   running   = FALSE;
+    BOOL   do_move   = FALSE;
+    BOOL   backup_ok = FALSE;
+    ULONG  new_lo    = 0;
+    char   cyl_str[12];
+    char   err_buf[256];
+
+    UWORD font_h, bor_l, bor_t, bor_b, inner_w, pad, row_h;
+    UWORD win_w, win_h, warn_h, gad_x, gad_w;
+    UWORD str_y, chk_y, btn_y, half;
+
+    sprintf(cyl_str, "%lu",
+            (unsigned long)(default_lo ? default_lo : pi->low_cyl));
+
+    scr = LockPubScreen(NULL);
+    if (!scr) return FALSE;
+
+    font_h  = scr->Font ? scr->Font->ta_YSize : 8;
+    bor_l   = scr->WBorLeft;
+    bor_t   = (UWORD)(scr->WBorTop + font_h + 1);
+    bor_b   = scr->WBorBottom;
+    pad     = 4;
+    row_h   = (UWORD)(font_h + 4);
+    inner_w = 420;
+    win_w   = (UWORD)(bor_l + inner_w + scr->WBorRight);
+
+    /* 5 warning text lines + 2 half-gaps */
+    warn_h  = (UWORD)((5 + 1) * (font_h + 2) + pad * 2 + (font_h + 2));
+
+    str_y = (UWORD)(bor_t + warn_h);
+    chk_y = (UWORD)(str_y + row_h + pad);
+    btn_y = (UWORD)(chk_y + row_h + pad);
+    win_h = (UWORD)(btn_y + row_h + pad + bor_b);
+
+    vi = GetVisualInfoA(scr, NULL);
+    if (!vi) goto mv_cleanup;
+
+    gctx = CreateContext(&glist);
+    if (!gctx) goto mv_cleanup;
+
+    gad_x = (UWORD)(bor_l + 110);
+    gad_w = (UWORD)(inner_w - 110 - pad);
+
+    /* STRING_KIND: new start cylinder */
+    {
+        struct NewGadget ng;
+        struct TagItem st[] = {
+            { GTST_String,   (ULONG)cyl_str },
+            { GTST_MaxChars, 10 },
+            { TAG_DONE, 0 }
+        };
+        memset(&ng, 0, sizeof(ng));
+        ng.ng_VisualInfo = vi;
+        ng.ng_TextAttr   = scr->Font;
+        ng.ng_LeftEdge   = gad_x;
+        ng.ng_TopEdge    = str_y;
+        ng.ng_Width      = (UWORD)(gad_w / 2);
+        ng.ng_Height     = row_h;
+        ng.ng_GadgetText = "New start cyl";
+        ng.ng_GadgetID   = MVDLG_NEWCYL;
+        ng.ng_Flags      = PLACETEXT_LEFT;
+        cyl_gad = CreateGadgetA(STRING_KIND, gctx, &ng, st);
+        if (!cyl_gad) goto mv_cleanup;
+    }
+
+    /* CHECKBOX_KIND: backup confirmation */
+    {
+        struct NewGadget ng;
+        struct TagItem cbt[] = { { GTCB_Checked, FALSE }, { TAG_DONE, 0 } };
+        static char chk_lbl[48];
+        sprintf(chk_lbl, "I have a current backup of %s", pi->drive_name);
+        memset(&ng, 0, sizeof(ng));
+        ng.ng_VisualInfo = vi;
+        ng.ng_TextAttr   = scr->Font;
+        ng.ng_LeftEdge   = (UWORD)(bor_l + pad);
+        ng.ng_TopEdge    = chk_y;
+        ng.ng_Width      = inner_w;
+        ng.ng_Height     = row_h;
+        ng.ng_GadgetText = chk_lbl;
+        ng.ng_GadgetID   = MVDLG_BACKUP;
+        ng.ng_Flags      = PLACETEXT_RIGHT;
+        chk_gad = CreateGadgetA(CHECKBOX_KIND, cyl_gad, &ng, cbt);
+        if (!chk_gad) goto mv_cleanup;
+    }
+
+    /* BUTTON_KIND: Move Partition | Cancel */
+    half = (UWORD)((inner_w - pad * 3) / 2);
+    {
+        struct NewGadget ng;
+        struct TagItem bt[] = { { TAG_DONE, 0 } };
+        struct Gadget *prev = chk_gad;
+        memset(&ng, 0, sizeof(ng));
+        ng.ng_VisualInfo = vi;
+        ng.ng_TextAttr   = scr->Font;
+        ng.ng_TopEdge    = btn_y;
+        ng.ng_Height     = row_h;
+        ng.ng_Width      = half;
+        ng.ng_Flags      = PLACETEXT_IN;
+
+        ng.ng_LeftEdge   = (UWORD)(bor_l + pad);
+        ng.ng_GadgetText = "Move Partition";
+        ng.ng_GadgetID   = MVDLG_MOVE;
+        btn_move = CreateGadgetA(BUTTON_KIND, prev, &ng, bt);
+        if (!btn_move) goto mv_cleanup;
+        prev = btn_move;
+
+        ng.ng_LeftEdge   = (UWORD)(bor_l + pad * 2 + half);
+        ng.ng_GadgetText = "Cancel";
+        ng.ng_GadgetID   = MVDLG_CANCEL;
+        if (!CreateGadgetA(BUTTON_KIND, prev, &ng, bt)) goto mv_cleanup;
+    }
+
+    {
+        struct TagItem wt[] = {
+            { WA_Left,      (ULONG)((scr->Width  - win_w) / 2) },
+            { WA_Top,       (ULONG)((scr->Height - win_h) / 2) },
+            { WA_Width,     win_w  },
+            { WA_Height,    win_h  },
+            { WA_Title,     (ULONG)"WARNING: Move Partition - Data Hazard" },
+            { WA_Gadgets,   (ULONG)glist },
+            { WA_PubScreen, (ULONG)scr   },
+            { WA_IDCMP,     IDCMP_CLOSEWINDOW | IDCMP_GADGETUP | IDCMP_REFRESHWINDOW },
+            { WA_Flags,     WFLG_DRAGBAR | WFLG_DEPTHGADGET | WFLG_CLOSEGADGET |
+                            WFLG_ACTIVATE | WFLG_SIMPLE_REFRESH },
+            { TAG_DONE, 0 }
+        };
+        dlg = OpenWindowTagList(NULL, wt);
+    }
+
+    UnlockPubScreen(NULL, scr); scr = NULL;
+    if (!dlg) goto mv_cleanup;
+
+    GT_RefreshWindow(dlg, NULL);
+    draw_move_warn_text(dlg, pi->drive_name, pi->low_cyl, pi->high_cyl);
+    ActivateGadget(cyl_gad, dlg, NULL);
+
+    running = TRUE;
+    while (running) {
+        struct IntuiMessage *imsg;
+        WaitPort(dlg->UserPort);
+        while ((imsg = GT_GetIMsg(dlg->UserPort)) != NULL) {
+            ULONG  iclass = imsg->Class;
+            UWORD  icode  = imsg->Code;
+            struct Gadget *igad = (struct Gadget *)imsg->IAddress;
+            GT_ReplyIMsg(imsg);
+
+            switch (iclass) {
+            case IDCMP_REFRESHWINDOW:
+                GT_RefreshWindow(dlg, NULL);
+                draw_move_warn_text(dlg, pi->drive_name,
+                                    pi->low_cyl, pi->high_cyl);
+                break;
+
+            case IDCMP_CLOSEWINDOW:
+                running = FALSE;
+                break;
+
+            case IDCMP_GADGETUP:
+                switch (igad->GadgetID) {
+                case MVDLG_BACKUP:
+                    backup_ok = (BOOL)(icode != 0);
+                    break;
+
+                case MVDLG_CANCEL:
+                    running = FALSE;
+                    break;
+
+                case MVDLG_MOVE: {
+                    char can_err[128];
+                    ULONG new_hi_tmp;
+
+                    /* Read target cylinder from string gadget */
+                    new_lo = 0;
+                    if (cyl_gad) {
+                        struct StringInfo *si =
+                            (struct StringInfo *)cyl_gad->SpecialInfo;
+                        if (si) new_lo = strtoul(si->Buffer, NULL, 10);
+                    }
+
+                    if (!backup_ok) {
+                        struct EasyStruct es = {
+                            sizeof(struct EasyStruct), 0,
+                            "Move Partition",
+                            "Tick the backup confirmation checkbox\n"
+                            "before proceeding.",
+                            "OK"
+                        };
+                        EasyRequest(dlg, &es, NULL);
+                        break;
+                    }
+
+                    if (!PART_CanMove(rdb, pi, new_lo, &new_hi_tmp, can_err)) {
+                        struct EasyStruct es = {
+                            sizeof(struct EasyStruct), 0,
+                            "Cannot Move Partition",
+                            can_err,
+                            "OK"
+                        };
+                        EasyRequest(dlg, &es, NULL);
+                        break;
+                    }
+
+                    do_move = TRUE;
+                    running = FALSE;
+                    break;
+                }
+                } /* switch igad->GadgetID */
+                break;
+            } /* switch iclass */
+        } /* while GT_GetIMsg */
+    } /* while running */
+
+    /* Close dialog before opening progress window */
+    CloseWindow(dlg); dlg = NULL;
+    FreeGadgets(glist); glist = NULL;
+    if (vi) { FreeVisualInfo(vi); vi = NULL; }
+
+    if (do_move) {
+        struct Screen *pscr = LockPubScreen(NULL);
+        if (pscr) {
+            UWORD pfh  = pscr->Font ? pscr->Font->ta_YSize : 8;
+            UWORD pbor = (UWORD)(pscr->WBorTop + pfh + 1);
+            UWORD pw_w = 380;
+            UWORD pw_h = (UWORD)(pbor + pscr->WBorBottom + pfh + 26);
+            struct TagItem pt[] = {
+                { WA_Left,      (ULONG)((pscr->Width  - pw_w) / 2) },
+                { WA_Top,       (ULONG)((pscr->Height - pw_h) / 2) },
+                { WA_Width,     pw_w  },
+                { WA_Height,    pw_h  },
+                { WA_Title,     (ULONG)"Moving Partition..." },
+                { WA_PubScreen, (ULONG)pscr },
+                { WA_Flags,     WFLG_DRAGBAR },
+                { WA_IDCMP,     0 },
+                { TAG_END, 0 }
+            };
+            struct Window *prog_win = OpenWindowTagList(NULL, pt);
+            struct MoveProgUD prog_ud;
+            BOOL moved;
+
+            UnlockPubScreen(NULL, pscr);
+
+            prog_ud.win = prog_win;
+            moved = PART_Move(bd, rdb, pi, new_lo, err_buf,
+                              move_progress_fn, &prog_ud);
+            if (prog_win) CloseWindow(prog_win);
+
+            if (moved) {
+                BOOL wrote_rdb = RDB_Write(bd, rdb);
+                struct EasyStruct ok_es;
+                static char ok_msg[384];
+                if (wrote_rdb) {
+                    sprintf(ok_msg,
+                        "Partition %s moved successfully.\n"
+                        "RDB written automatically.\n"
+                        "Reboot to use the moved partition.\n\n"
+                        "%s",
+                        pi->drive_name, err_buf);
+                } else {
+                    sprintf(ok_msg,
+                        "Partition %s moved successfully.\n"
+                        "WARNING: RDB write FAILED.\n"
+                        "Click Write to save the RDB.\n\n"
+                        "%s",
+                        pi->drive_name, err_buf);
+                }
+                ok_es.es_StructSize   = sizeof(ok_es);
+                ok_es.es_Flags        = 0;
+                ok_es.es_Title        = (UBYTE *)"Partition Moved";
+                ok_es.es_TextFormat   = (UBYTE *)ok_msg;
+                ok_es.es_GadgetFormat = (UBYTE *)"OK";
+                EasyRequest(win, &ok_es, NULL);
+                result = TRUE;
+            } else {
+                struct EasyStruct err_es;
+                static char err_msg[384];
+                sprintf(err_msg,
+                    "Move FAILED:\n%s\n\n"
+                    "Data may be partially written.\n"
+                    "Restore from backup before rebooting.",
+                    err_buf);
+                err_es.es_StructSize   = sizeof(err_es);
+                err_es.es_Flags        = 0;
+                err_es.es_Title        = (UBYTE *)"Move Failed";
+                err_es.es_TextFormat   = (UBYTE *)err_msg;
+                err_es.es_GadgetFormat = (UBYTE *)"OK";
+                EasyRequest(win, &err_es, NULL);
+            }
+        }
+    }
+
+mv_cleanup:
+    if (dlg)   CloseWindow(dlg);
+    if (glist) FreeGadgets(glist);
+    if (vi)    FreeVisualInfo(vi);
+    if (scr)   UnlockPubScreen(NULL, scr);
+    return result;
+}
+
 /* ------------------------------------------------------------------ */
 /* Offer to grow an FFS/OFS filesystem after a partition was extended.  */
 /* Called from all three "edit partition" code paths.                   */
@@ -5572,6 +6041,16 @@ BOOL partview_run(const char *devname, ULONG unit)
     ULONG dbl_mic   = 0;
     WORD  dbl_part  = -1;   /* partition clicked last time */
 
+    /* Drag-move state (move whole partition by dragging its body) */
+    WORD  drag_move_part   = -1;   /* -1 = not active */
+    ULONG drag_move_orig_lo = 0;
+    ULONG drag_move_orig_hi = 0;
+    ULONG drag_move_width   = 0;   /* hi - lo, preserved during move */
+    ULONG drag_move_min_lo  = 0;   /* minimum allowed lo_cyl */
+    ULONG drag_move_max_lo  = 0;   /* maximum allowed lo_cyl */
+    WORD  drag_move_anchor_x  = 0; /* pixel x where drag began */
+    ULONG drag_move_anchor_cyl = 0; /* cylinder at anchor pixel */
+
     /* New-partition drag state */
     BOOL  drag_new       = FALSE;
     ULONG drag_new_lo    = 0;
@@ -5871,11 +6350,12 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     }
                                 }
 
-                                drag_part    = part;
-                                drag_edge    = edge;
-                                drag_orig_lo = rdb->parts[part].low_cyl;
-                                drag_orig_hi = rdb->parts[part].high_cyl;
-                                dbl_part     = -1;
+                                drag_part      = part;
+                                drag_edge      = edge;
+                                drag_orig_lo   = rdb->parts[part].low_cyl;
+                                drag_orig_hi   = rdb->parts[part].high_cyl;
+                                drag_move_part = -1;
+                                dbl_part       = -1;
                                 if (edge == 0) {
                                     drag_min = left_end;
                                     drag_max = rdb->parts[part].high_cyl;
@@ -5913,13 +6393,41 @@ BOOL partview_run(const char *devname, ULONG unit)
                                             }
                                         }
                                     } else {
-                                        /* Single click: select partition */
+                                        /* Single click: select + start drag-move */
+                                        ULONG left_end2   = rdb->lo_cyl;
+                                        ULONG right_start2 = rdb->hi_cyl + 1;
+                                        ULONG width2;
+                                        UWORD kk2;
                                         sel      = blk;
                                         dbl_part = blk;
                                         dbl_sec  = ev_sec;
                                         dbl_mic  = ev_mic;
                                         refresh_listview(win, lv_gad, rdb, sel);
                                         draw_map(win, rdb, sel, bx, by, bw, bh);
+
+                                        /* Compute free space bounds for drag */
+                                        for (kk2 = 0; kk2 < rdb->num_parts; kk2++) {
+                                            if (kk2 == (UWORD)blk) continue;
+                                            if (rdb->parts[kk2].high_cyl < rdb->parts[blk].low_cyl) {
+                                                if (rdb->parts[kk2].high_cyl + 1 > left_end2)
+                                                    left_end2 = rdb->parts[kk2].high_cyl + 1;
+                                            }
+                                            if (rdb->parts[kk2].low_cyl > rdb->parts[blk].high_cyl) {
+                                                if (rdb->parts[kk2].low_cyl < right_start2)
+                                                    right_start2 = rdb->parts[kk2].low_cyl;
+                                            }
+                                        }
+                                        width2 = rdb->parts[blk].high_cyl - rdb->parts[blk].low_cyl;
+                                        drag_move_part      = blk;
+                                        drag_move_orig_lo   = rdb->parts[blk].low_cyl;
+                                        drag_move_orig_hi   = rdb->parts[blk].high_cyl;
+                                        drag_move_width     = width2;
+                                        drag_move_min_lo    = left_end2;
+                                        drag_move_max_lo    = (right_start2 > width2)
+                                                              ? right_start2 - 1 - width2
+                                                              : left_end2;
+                                        drag_move_anchor_x   = mouse_x;
+                                        drag_move_anchor_cyl = rdb->parts[blk].low_cyl;
                                     }
                                 } else if (rdb->num_parts < MAX_PARTITIONS &&
                                            rdb->heads > 0 && rdb->sectors > 0) {
@@ -6035,6 +6543,28 @@ BOOL partview_run(const char *devname, ULONG unit)
                             draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
                                         hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
+                        } else if (drag_move_part >= 0) {
+                            WORD confirmed_move = drag_move_part;
+                            ULONG dragged_lo    = rdb->parts[confirmed_move].low_cyl;
+                            drag_move_part = -1;
+
+                            /* Restore partition to original position first */
+                            rdb->parts[confirmed_move].low_cyl  = drag_move_orig_lo;
+                            rdb->parts[confirmed_move].high_cyl = drag_move_orig_hi;
+
+                            if (dragged_lo != drag_move_orig_lo && bd) {
+                                /* Partition was dragged — open move dialog pre-filled */
+                                if (offer_move_partition(win, bd, rdb,
+                                                         &rdb->parts[confirmed_move],
+                                                         dragged_lo)) {
+                                    needs_reboot = TRUE;
+                                    sel = confirmed_move;
+                                }
+                            }
+                            refresh_listview(win, lv_gad, rdb, sel);
+                            draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
+                                        ix, iy, iw, bx, by, bw, bh,
+                                        hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                         }
                     }
                     break;
@@ -6060,6 +6590,36 @@ BOOL partview_run(const char *devname, ULONG unit)
 
                         draw_map(win, rdb, sel, bx, by, bw, bh);
                         draw_drag_info(win, rdb, drag_part, bx, by, bw, bh);
+                    } else if (drag_move_part >= 0 && rdb && rdb->valid) {
+                        WORD  mx2   = bx + 1;
+                        UWORD mw2   = bw - 2;
+                        ULONG total = rdb->hi_cyl + 1;
+                        LONG  dpx   = (LONG)(mouse_x - drag_move_anchor_x);
+                        LONG  dcyl;
+                        ULONG new_lo;
+
+                        /* Convert pixel delta to cylinder delta */
+                        if (mw2 > 0)
+                            dcyl = (LONG)((UQUAD)(ULONG)(dpx < 0 ? -dpx : dpx)
+                                          * total / (ULONG)mw2);
+                        else
+                            dcyl = 0;
+                        if (dpx < 0) dcyl = -dcyl;
+
+                        /* Compute and clamp new lo */
+                        if (dcyl < 0 &&
+                            (ULONG)(-dcyl) > drag_move_anchor_cyl)
+                            new_lo = 0;
+                        else
+                            new_lo = (ULONG)((LONG)drag_move_anchor_cyl + dcyl);
+                        if (new_lo < drag_move_min_lo) new_lo = drag_move_min_lo;
+                        if (new_lo > drag_move_max_lo) new_lo = drag_move_max_lo;
+
+                        rdb->parts[drag_move_part].low_cyl  = new_lo;
+                        rdb->parts[drag_move_part].high_cyl = new_lo + drag_move_width;
+
+                        draw_map(win, rdb, sel, bx, by, bw, bh);
+                        draw_drag_info(win, rdb, drag_move_part, bx, by, bw, bh);
                     } else if (drag_new && rdb && rdb->valid) {
                         WORD  mx2   = bx + 1;
                         UWORD mw2   = bw - 2;
@@ -6357,6 +6917,18 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 dirty = TRUE; needs_reboot = TRUE;
                                 if (sel >= (WORD)rdb->num_parts)
                                     sel = (WORD)rdb->num_parts - 1;
+                                refresh_listview(win, lv_gad, rdb, sel);
+                                draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
+                                            ix, iy, iw, bx, by, bw, bh,
+                                            hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
+                            }
+                        }
+                        break;
+
+                    case GID_MOVE:
+                        if (sel >= 0 && sel < (WORD)rdb->num_parts && bd) {
+                            if (offer_move_partition(win, bd, rdb, &rdb->parts[sel], 0)) {
+                                needs_reboot = TRUE;
                                 refresh_listview(win, lv_gad, rdb, sel);
                                 draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
