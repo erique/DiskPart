@@ -5231,23 +5231,71 @@ static void check_ffs_root(struct Window *win, struct BlockDev *bd,
 /* Offer to grow an FFS/OFS filesystem after a partition was extended.  */
 /* Called from all three "edit partition" code paths.                   */
 /* ------------------------------------------------------------------ */
+struct GrowProgUD {
+    struct Window *win;
+    UWORD step;
+    UWORD total;
+};
+
 static void ffs_grow_progress(void *ud, const char *msg)
 {
-    struct Window *pw = (struct Window *)ud;
+    struct GrowProgUD *pu = (struct GrowProgUD *)ud;
+    struct Window *pw;
     struct RastPort *rp;
     WORD x1, y1, x2, y2;
+    WORD bar_x, bar_y, bar_w, bar_h, filled_w;
     UWORD len;
 
-    if (!pw) return;
+    if (!pu || !pu->win) return;
+    pw = pu->win;
+    if (pu->step < pu->total) pu->step++;
+
     rp = pw->RPort;
     x1 = pw->BorderLeft;
     y1 = pw->BorderTop;
     x2 = (WORD)(pw->Width  - 1 - pw->BorderRight);
     y2 = (WORD)(pw->Height - 1 - pw->BorderBottom);
+
+    /* Clear interior */
     SetAPen(rp, 0);
     RectFill(rp, x1, y1, x2, y2);
+
+    /* Progress bar */
+    bar_x = (WORD)(x1 + 4);
+    bar_y = (WORD)(y1 + 4);
+    bar_w = (WORD)(x2 - x1 - 8);
+    bar_h = 6;
+
+    if (bar_w > 0) {
+        filled_w = (pu->total > 0)
+            ? (WORD)((ULONG)bar_w * pu->step / pu->total)
+            : 0;
+
+        /* Empty track (pen 2 = shine/highlight) */
+        SetAPen(rp, 2);
+        RectFill(rp, bar_x, bar_y,
+                 (WORD)(bar_x + bar_w), (WORD)(bar_y + bar_h));
+
+        /* Filled portion (pen 3 = fill pen) */
+        if (filled_w > 0) {
+            SetAPen(rp, 3);
+            RectFill(rp, bar_x, bar_y,
+                     (WORD)(bar_x + filled_w), (WORD)(bar_y + bar_h));
+        }
+
+        /* 1-pixel border (pen 1 = text/foreground) */
+        SetAPen(rp, 1);
+        Move(rp, bar_x, bar_y);
+        Draw(rp, (WORD)(bar_x + bar_w), bar_y);
+        Draw(rp, (WORD)(bar_x + bar_w), (WORD)(bar_y + bar_h));
+        Draw(rp, bar_x, (WORD)(bar_y + bar_h));
+        Draw(rp, bar_x, bar_y);
+    }
+
+    /* Message text below the bar */
     SetAPen(rp, 1);
-    Move(rp, (WORD)(x1 + 6), (WORD)(y1 + 4 + rp->TxBaseline));
+    Move(rp, (WORD)(x1 + 6),
+         (WORD)(bar_y + bar_h + 4 + rp->TxBaseline));
     for (len = 0; msg[len]; len++) {}
     Text(rp, (STRPTR)msg, (WORD)len);
 }
@@ -5274,14 +5322,11 @@ static void offer_ffs_grow(struct Window *win, struct BlockDev *bd,
     es.es_GadgetFormat = (UBYTE *)"Grow Filesystem|Skip";
 
     if (EasyRequest(win, &es, NULL, pi->drive_name) == 1) {
-        /* Open a small progress window so the user can see what is happening.
-           The grow operation is synchronous; the progress window shows the
-           current phase in its interior via the ffs_grow_progress callback. */
         struct Screen *scr = win->WScreen;
         UWORD font_h = scr->Font ? scr->Font->ta_YSize : 8;
         UWORD bor_t  = (UWORD)(scr->WBorTop + font_h + 1);
         UWORD pw_w   = 360;
-        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 10);
+        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 26);
         struct TagItem prog_tags[] = {
             { WA_Left,      (ULONG)((scr->Width  - pw_w) / 2) },
             { WA_Top,       (ULONG)((scr->Height - pw_h) / 2) },
@@ -5294,9 +5339,13 @@ static void offer_ffs_grow(struct Window *win, struct BlockDev *bd,
             { TAG_END,      0             }
         };
         struct Window *prog_win = OpenWindowTagList(NULL, prog_tags);
+        struct GrowProgUD prog_ud;
+        prog_ud.win   = prog_win;
+        prog_ud.step  = 0;
+        prog_ud.total = 13;  /* FFS_PROGRESS call count */
 
         BOOL result = FFS_GrowPartition(bd, rdb, pi, old_hi, errbuf,
-                                        ffs_grow_progress, prog_win);
+                                        ffs_grow_progress, &prog_ud);
         if (prog_win) CloseWindow(prog_win);
         if (result) {
             struct EasyStruct ok_es;
@@ -5352,7 +5401,7 @@ static void offer_pfs_grow(struct Window *win, struct BlockDev *bd,
         UWORD font_h = scr->Font ? scr->Font->ta_YSize : 8;
         UWORD bor_t  = (UWORD)(scr->WBorTop + font_h + 1);
         UWORD pw_w   = 360;
-        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 10);
+        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 26);
         struct TagItem prog_tags[] = {
             { WA_Left,      (ULONG)((scr->Width  - pw_w) / 2) },
             { WA_Top,       (ULONG)((scr->Height - pw_h) / 2) },
@@ -5365,9 +5414,13 @@ static void offer_pfs_grow(struct Window *win, struct BlockDev *bd,
             { TAG_END,      0             }
         };
         struct Window *prog_win = OpenWindowTagList(NULL, prog_tags);
+        struct GrowProgUD prog_ud;
+        prog_ud.win   = prog_win;
+        prog_ud.step  = 0;
+        prog_ud.total = 6;   /* PFS_PROGRESS call count */
 
         BOOL result = PFS_GrowPartition(bd, rdb, pi, old_hi, errbuf,
-                                        ffs_grow_progress, prog_win);
+                                        ffs_grow_progress, &prog_ud);
         if (prog_win) CloseWindow(prog_win);
         if (result) {
             struct EasyStruct ok_es;
@@ -5422,7 +5475,7 @@ static void offer_sfs_grow(struct Window *win, struct BlockDev *bd,
         UWORD font_h = scr->Font ? scr->Font->ta_YSize : 8;
         UWORD bor_t  = (UWORD)(scr->WBorTop + font_h + 1);
         UWORD pw_w   = 360;
-        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 10);
+        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 26);
         struct TagItem prog_tags[] = {
             { WA_Left,      (ULONG)((scr->Width  - pw_w) / 2) },
             { WA_Top,       (ULONG)((scr->Height - pw_h) / 2) },
@@ -5435,9 +5488,13 @@ static void offer_sfs_grow(struct Window *win, struct BlockDev *bd,
             { TAG_END,      0             }
         };
         struct Window *prog_win = OpenWindowTagList(NULL, prog_tags);
+        struct GrowProgUD prog_ud;
+        prog_ud.win   = prog_win;
+        prog_ud.step  = 0;
+        prog_ud.total = 14;  /* SFS_PROGRESS call count */
 
         BOOL result = SFS_GrowPartition(bd, rdb, pi, old_hi, errbuf,
-                                        ffs_grow_progress, prog_win);
+                                        ffs_grow_progress, &prog_ud);
         if (prog_win) CloseWindow(prog_win);
         if (result) {
             BOOL wrote_rdb = RDB_Write(bd, rdb);
