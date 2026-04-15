@@ -45,6 +45,7 @@
 #include "version.h"
 #include "ffsresize.h"
 #include "pfsresize.h"
+#include "sfsresize.h"
 
 /* ------------------------------------------------------------------ */
 /* External library bases (defined in main.c)                          */
@@ -5395,6 +5396,92 @@ static void offer_pfs_grow(struct Window *win, struct BlockDev *bd,
     }
 }
 
+static void offer_sfs_grow(struct Window *win, struct BlockDev *bd,
+                           struct RDBInfo *rdb, struct PartInfo *pi,
+                           ULONG old_hi)
+{
+    struct EasyStruct es;
+    char errbuf[256];
+
+    if (pi->high_cyl <= old_hi) return;
+    if (!SFS_IsSupportedType(pi->dos_type)) return;
+    if (!bd) return;
+
+    es.es_StructSize   = sizeof(es);
+    es.es_Flags        = 0;
+    es.es_Title        = (UBYTE *)"EXPERIMENTAL: Grow Filesystem";
+    es.es_TextFormat   = (UBYTE *)
+        "This will update SmartFileSystem metadata directly on disk.\n"
+        "This feature is EXPERIMENTAL and may corrupt data.\n"
+        "Always have a backup before proceeding.\n\n"
+        "Grow SFS filesystem on partition %s?";
+    es.es_GadgetFormat = (UBYTE *)"Grow Filesystem|Skip";
+
+    if (EasyRequest(win, &es, NULL, pi->drive_name) == 1) {
+        struct Screen *scr = win->WScreen;
+        UWORD font_h = scr->Font ? scr->Font->ta_YSize : 8;
+        UWORD bor_t  = (UWORD)(scr->WBorTop + font_h + 1);
+        UWORD pw_w   = 360;
+        UWORD pw_h   = (UWORD)(bor_t + scr->WBorBottom + font_h + 10);
+        struct TagItem prog_tags[] = {
+            { WA_Left,      (ULONG)((scr->Width  - pw_w) / 2) },
+            { WA_Top,       (ULONG)((scr->Height - pw_h) / 2) },
+            { WA_Width,     (ULONG)pw_w  },
+            { WA_Height,    (ULONG)pw_h  },
+            { WA_Title,     (ULONG)"Growing SFS Filesystem..." },
+            { WA_PubScreen, (ULONG)scr   },
+            { WA_Flags,     (ULONG)WFLG_DRAGBAR },
+            { WA_IDCMP,     0             },
+            { TAG_END,      0             }
+        };
+        struct Window *prog_win = OpenWindowTagList(NULL, prog_tags);
+
+        BOOL result = SFS_GrowPartition(bd, rdb, pi, old_hi, errbuf,
+                                        ffs_grow_progress, prog_win);
+        if (prog_win) CloseWindow(prog_win);
+        if (result) {
+            BOOL wrote_rdb = RDB_Write(bd, rdb);
+            struct EasyStruct ok_es;
+            static char ok_msg[512];
+            if (wrote_rdb) {
+                sprintf(ok_msg,
+                        "SFS filesystem on %s grown successfully.\n"
+                        "RDB written automatically.\n"
+                        "%s: is INHIBITED (inaccessible) until reboot.\n"
+                        "Reboot NOW to use the new space.\n\n"
+                        "Diagnostic: %s",
+                        pi->drive_name, pi->drive_name, errbuf);
+            } else {
+                sprintf(ok_msg,
+                        "SFS filesystem on %s grown successfully.\n"
+                        "WARNING: RDB write FAILED.\n"
+                        "Click Write to save the RDB before rebooting.\n"
+                        "%s: is INHIBITED (inaccessible) until reboot.\n"
+                        "1. Click Write (save RDB)\n"
+                        "2. Reboot NOW\n\n"
+                        "Diagnostic: %s",
+                        pi->drive_name, pi->drive_name, errbuf);
+            }
+            ok_es.es_StructSize   = sizeof(ok_es);
+            ok_es.es_Flags        = 0;
+            ok_es.es_Title        = (UBYTE *)"Filesystem Grown";
+            ok_es.es_TextFormat   = (UBYTE *)ok_msg;
+            ok_es.es_GadgetFormat = (UBYTE *)"OK";
+            EasyRequest(win, &ok_es, NULL);
+        } else {
+            struct EasyStruct err_es;
+            static char full_msg[384];
+            sprintf(full_msg, "SFS grow failed:\n%s", errbuf);
+            err_es.es_StructSize   = sizeof(err_es);
+            err_es.es_Flags        = 0;
+            err_es.es_Title        = (UBYTE *)"Filesystem Grow Failed";
+            err_es.es_TextFormat   = (UBYTE *)full_msg;
+            err_es.es_GadgetFormat = (UBYTE *)"OK";
+            EasyRequest(win, &err_es, NULL);
+        }
+    }
+}
+
 BOOL partview_run(const char *devname, ULONG unit)
 {
     struct BlockDev  *bd       = NULL;
@@ -5759,6 +5846,8 @@ BOOL partview_run(const char *devname, ULONG unit)
                                                                &rdb->parts[sel], old_hi);
                                                 offer_pfs_grow(win, bd, rdb,
                                                                &rdb->parts[sel], old_hi);
+                                                offer_sfs_grow(win, bd, rdb,
+                                                               &rdb->parts[sel], old_hi);
                                                 dirty = TRUE;
                                                 refresh_listview(win, lv_gad, rdb, sel);
                                                 draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
@@ -5841,6 +5930,9 @@ BOOL partview_run(const char *devname, ULONG unit)
                                                    &rdb->parts[confirmed_part],
                                                    drag_orig_hi);
                                     offer_pfs_grow(win, bd, rdb,
+                                                   &rdb->parts[confirmed_part],
+                                                   drag_orig_hi);
+                                    offer_sfs_grow(win, bd, rdb,
                                                    &rdb->parts[confirmed_part],
                                                    drag_orig_hi);
                                 } else {
@@ -5955,6 +6047,8 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 offer_ffs_grow(win, bd, rdb,
                                                &rdb->parts[sel], old_hi);
                                 offer_pfs_grow(win, bd, rdb,
+                                               &rdb->parts[sel], old_hi);
+                                offer_sfs_grow(win, bd, rdb,
                                                &rdb->parts[sel], old_hi);
                                 dirty = TRUE;
                                 refresh_listview(win, lv_gad, rdb, sel);
@@ -6173,6 +6267,8 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 offer_ffs_grow(win, bd, rdb,
                                                &rdb->parts[sel], old_hi);
                                 offer_pfs_grow(win, bd, rdb,
+                                               &rdb->parts[sel], old_hi);
+                                offer_sfs_grow(win, bd, rdb,
                                                &rdb->parts[sel], old_hi);
                                 dirty = TRUE;
                                 refresh_listview(win, lv_gad, rdb, sel);
