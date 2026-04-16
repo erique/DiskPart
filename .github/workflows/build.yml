@@ -14,14 +14,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Generate icon
+        run: |
+          pip install pillow -q
+          make icon
+
       - name: Build with Bebbo toolchain (Docker, linux/amd64)
         run: ./docker.sh
 
-      - name: Upload binary
+      - name: Upload binary + icon
         uses: actions/upload-artifact@v4
         with:
           name: DiskPart
-          path: out/DiskPart.exe
+          path: |
+            out/DiskPart
+            out/DiskPart.info
           if-no-files-found: error
 
   release:
@@ -45,17 +52,12 @@ jobs:
         id: date
         run: echo "DATE=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Regenerate icon
-        run: |
-          pip install pillow -q
-          python3 support/make_icon.py
-
       - name: Create LHA archive
         run: |
           ARCHIVE="DiskPart-${{ steps.date.outputs.DATE }}-PROTO.lha"
           python3 support/make_lha.py "$ARCHIVE" \
-            "DiskPart:out/DiskPart.exe" \
-            "DiskPart.info:DiskPart.info" \
+            "DiskPart:out/DiskPart" \
+            "DiskPart.info:out/DiskPart.info" \
             "README.md:README.md"
           ls -lh "$ARCHIVE"
 
