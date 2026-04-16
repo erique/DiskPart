@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with Bebbo toolchain (Docker, linux/amd64)
+        run: ./docker.sh
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskPart
+          path: out/DiskPart.exe
+          if-no-files-found: error
