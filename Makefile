@@ -74,9 +74,15 @@ src_c   := $(wildcard src/*.c)
 src_obj := $(addprefix obj/,$(patsubst src/%.c,%.o,$(src_c)))
 objects := $(src_obj) $(TC_SUPPORT_OBJ)
 
-.PHONY: all clean
+.PHONY: all clean icon
 
 all: $(program)
+
+icon: $(program).info
+
+$(program).info: support/hdicon.png support/make_icon.py
+	$(info Generating $@)
+	@python3 support/make_icon.py $@
 
 ifeq ($(NEED_ELF2HUNK),1)
 
